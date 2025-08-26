@@ -46,7 +46,7 @@ def _inc(stat_key: str) -> None:
 # ─────────────────────────────────────────
 WIG20_HC_TICKERS = [
     "PKN", "KGH", "PKO", "PEO", "PZU", "PGE", "CDR", "ALE", "DNP", "LPP",
-    "OPL", "CPS", "ALR", "ING", "MBK", "TPE", "JSW", "CCC", "KTY", "PKN"
+    "OPL", "CPS", "ALR", "ING", "MBK", "TPE", "JSW", "CCC", "KTY"
 ]
 
 MWIG40_HC_TICKERS = [
@@ -238,7 +238,7 @@ def parse_gpw_tickers(raw: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────
-# CRT – LOGIKA
+# CRT – LOGIKA (naprawiona)
 # ─────────────────────────────────────────
 
 def midline(low: float, high: float) -> float:
@@ -251,19 +251,27 @@ def _find_c3(
     c1_low: float,
     c1_high: float,
     method: str,
-    direction: str,
+    dir_tag: str,
 ) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Zwraca: (c3_idx_within_N, c3_idx_to_end)
+    Tu wykrywamy 'do końca serii' (any) i zwracamy indeks C3 (jeśli wystąpił).
+    """
     n = len(d)
     c3_any_idx = None
+
     for j in range(i_c2 + 1, n):
-        H, L, C = float(d.iloc[j]["High"]), float(d.iloc[j]["Low"]), float(d.iloc[j]["Close"])
-        if direction == "BULL":
+        H = float(d.iloc[j]["High"])
+        L = float(d.iloc[j]["Low"])
+        C = float(d.iloc[j]["Close"])
+        if dir_tag == "BULL":
             cond_any = (H > c1_high) if method == "high" else (C > c1_high)
-        else:
+        else:  # BEAR
             cond_any = (L < c1_low) if method == "high" else (C < c1_low)
         if cond_any:
             c3_any_idx = j
             break
+
     return None, c3_any_idx
 
 
@@ -272,11 +280,14 @@ def crt_scan(
     lookback_bars: int = 30,
     require_midline: bool = False,
     strict_vs_c1open: bool = False,
-    confirm_within: int = 0,
-    confirm_method: str = "high",
+    confirm_within: int = 0,            # 0 = brak potwierdzenia C3
+    confirm_method: str = "high",       # 'high' (knot) lub 'close' (zamknięcie)
     directions: Tuple[str, ...] = ("bullish", "bearish"),
 ) -> List[Dict]:
-    out = []
+    """
+    Zwraca listę setupów CRT (C1/C2/C3 + metadane).
+    """
+    out: List[Dict] = []
     if df is None or df.empty or len(df) < 5:
         return out
 
@@ -296,31 +307,45 @@ def crt_scan(
         close_in = (C1L <= C2C <= C1H)
 
         def _record(direction: str, swept_side: str):
-            c3_within_idx, c3_any_idx = _find_c3(d, i, C1L, C1H, confirm_method, direction)
+            dir_tag = "BULL" if direction == "bullish" else "BEAR"
+            c3_within_idx, c3_any_idx = _find_c3(d, i, C1L, C1H, confirm_method, dir_tag)
 
+            # Weryfikacja potwierdzenia C3 w określonej liczbie świec
             confirmed_within = False
             if confirm_within and confirm_within > 0 and (i + 1) < n:
                 end_j = min(n - 1, i + confirm_within)
                 for j in range(i + 1, end_j + 1):
-                    H, L, C = float(d.iloc[j]["High"]), float(d.iloc[j]["Low"]), float(d.iloc[j]["Close"])
-                    if direction == "BULL":
+                    H = float(d.iloc[j]["High"])
+                    L = float(d.iloc[j]["Low"])
+                    C = float(d.iloc[j]["Close"])
+                    if dir_tag == "BULL":
                         cond = (H > C1H) if confirm_method == "high" else (C > C1H)
-                    else:
+                    else:  # BEAR
                         cond = (L < C1L) if confirm_method == "high" else (C < C1L)
                     if cond:
                         confirmed_within = True
                         c3_within_idx = j
                         break
 
+            # Czytelny opis reguły potwierdzającej
+            if confirm_within:
+                if confirm_method == "high":
+                    rule = "high>C1H" if dir_tag == "BULL" else "low<C1L"
+                else:  # close
+                    rule = "close>C1H" if dir_tag == "BULL" else "close<C1L"
+                confirm_rule = f"{rule} in {confirm_within}"
+            else:
+                confirm_rule = "no confirm"
+
             rec = {
-                "direction": "BULL" if direction == "bullish" else "BEAR",
+                "direction": dir_tag,
                 "C1_date": d.index[i - 1],
                 "C2_date": d.index[i],
                 "C3_date_within": d.index[c3_within_idx] if c3_within_idx is not None else pd.NaT,
                 "C3_date_any": d.index[c3_any_idx] if c3_any_idx is not None else pd.NaT,
                 "confirmed": bool(confirmed_within),
                 "c3_happened": bool(c3_any_idx is not None),
-                "confirm_rule": f"{confirm_method}>{'C1H' if direction=='bullish' else 'C1L'} in {confirm_within}" if confirm_within else "no confirm",
+                "confirm_rule": confirm_rule,
                 "C1_low": C1L, "C1_high": C1H, "C1_mid": C1_mid, "C1_open": C1O,
                 "C2_low": C2L, "C2_high": C2H, "C2_close": C2C,
                 "C2_position_in_range": (C2C - C1L) / (C1H - C1L) if (C1H > C1L) else np.nan,
@@ -328,6 +353,7 @@ def crt_scan(
             }
             out.append(rec)
 
+        # Byczy: sweep LOW C1 + close back in range (+opcje)
         if "bullish" in directions:
             cond = (C2L < C1L) and close_in
             if require_midline:
@@ -337,6 +363,7 @@ def crt_scan(
             if cond:
                 _record("bullish", "LOW")
 
+        # Niedźwiedzi: sweep HIGH C1 + close back in range (+opcje)
         if "bearish" in directions:
             cond = (C2H > C1H) and close_in
             if require_midline:
@@ -346,15 +373,11 @@ def crt_scan(
             if cond:
                 _record("bearish", "HIGH")
 
-    out.sort(key=lambda r: (pd.Timestamp(r["C2_date"]) if pd.notna(r["C2_date"]) else pd.Timestamp(0)), reverse=True)
+    out.sort(
+        key=lambda r: (pd.Timestamp(r["C2_date"]) if pd.notna(r["C2_date"]) else pd.Timestamp(0)),
+        reverse=True,
+    )
     return out
-
-
-try:
-    from crt_core import crt_scan as _crt_scan_fixed
-    crt_scan = _crt_scan_fixed  # type: ignore
-except Exception:
-    pass
 
 
 # ─────────────────────────────────────────
@@ -523,6 +546,17 @@ for i, yt in enumerate(active_tickers, start=1):
     try:
         df = load_weekly_ohlcv(yt, period=period)
         if df is None or df.empty or len(df) < 5:
+            # W trybie okazji pomijamy puste (brak danych), w przeciwnym dodajemy informację
+            if not opportunity_mode:
+                rows.append({
+                    "Ticker": yt, "Spółka": meta_map.get(yt, {}).get("company", yt.replace(".WA", "")),
+                    "Grupa": meta_map.get(yt, {}).get("group", ""),
+                    "Kierunek": "-", "C1": pd.NaT, "C2": pd.NaT, "C3_any": pd.NaT,
+                    "Potwierdzenie_w_N": "-", "C3_happened": "-", "Zasada potwierdzenia": "Brak danych",
+                    "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
+                    "C2L": np.nan, "C2H": np.nan, "C2C": np.nan, "C2 pos w C1%": np.nan, "Sweep": "-",
+                    "Trigger": np.nan, "Stop": np.nan, "TP1": np.nan, "TP2": np.nan, "R:TP1": np.nan, "R:TP2": np.nan,
+                })
             continue
 
         setups = crt_scan(
@@ -540,8 +574,9 @@ for i, yt in enumerate(active_tickers, start=1):
                 rows.append({
                     "Ticker": yt, "Spółka": meta_map.get(yt, {}).get("company", yt.replace(".WA", "")),
                     "Grupa": meta_map.get(yt, {}).get("group", ""),
-                    "Kierunek": "-", "C1": pd.NaT, "C2": pd.NaT, "C3": pd.NaT, "Potwierdzenie": "-",
-                    "Zasada potwierdzenia": "-", "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
+                    "Kierunek": "-", "C1": pd.NaT, "C2": pd.NaT, "C3_any": pd.NaT, "Potwierdzenie_w_N": "-",
+                    "C3_happened": "NIE", "Zasada potwierdzenia": ("no confirm" if not confirm_on else f"{confirm_method} in {confirm_within}"),
+                    "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
                     "C2L": np.nan, "C2H": np.nan, "C2C": np.nan, "C2 pos w C1%": np.nan, "Sweep": "-",
                     "Trigger": np.nan, "Stop": np.nan, "TP1": np.nan, "TP2": np.nan, "R:TP1": np.nan, "R:TP2": np.nan,
                 })

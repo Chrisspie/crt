@@ -1,8 +1,6 @@
-streamlit>=1.32
-yfinance>=0.2.38
+streamlit>=1.31
 pandas>=2.0
 numpy>=1.24
+yfinance>=0.2.40
 requests>=2.31
 lxml>=4.9
-beautifulsoup4>=4.12
-html5lib>=1.1
