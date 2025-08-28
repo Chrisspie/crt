@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
+import math
 
 import numpy as np
 import pandas as pd
@@ -31,6 +32,7 @@ if "CACHE_STATS" not in st.session_state:
         "wig_all_runs": 0,
         "sp500_fetch_runs": 0,
         "load_weekly_ohlcv_runs": 0,
+        "load_htf_runs": 0,
     }
 
 
@@ -201,6 +203,25 @@ def load_weekly_ohlcv(yahoo_ticker: str, period: str = "5y") -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=60 * 60 * 12)
+def load_htf_ohlcv(yahoo_ticker: str, interval: str = "1mo", period: str = "max") -> pd.DataFrame:
+    """Ładuje miesięczne/kwartalne OHLC (1mo/3mo)."""
+    _inc("load_htf_runs")
+    df = yf.download(
+        yahoo_ticker,
+        interval=interval,
+        period=period,
+        auto_adjust=False,
+        progress=False,
+        threads=YF_THREADS,
+    )
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if not df.empty:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    return df
+
+
 # ─────────────────────────────────────────
 # PARSERY INPUTÓW
 # ─────────────────────────────────────────
@@ -246,12 +267,12 @@ def midline(low: float, high: float) -> float:
 
 
 def _find_c3(
-    d: pd.DataFrame,
-    i_c2: int,
-    c1_low: float,
-    c1_high: float,
-    method: str,
-    dir_tag: str,
+        d: pd.DataFrame,
+        i_c2: int,
+        c1_low: float,
+        c1_high: float,
+        method: str,
+        dir_tag: str,
 ) -> Tuple[Optional[int], Optional[int]]:
     """
     Zwraca: (c3_idx_within_N, c3_idx_to_end)
@@ -276,13 +297,13 @@ def _find_c3(
 
 
 def crt_scan(
-    df: pd.DataFrame,
-    lookback_bars: int = 30,
-    require_midline: bool = False,
-    strict_vs_c1open: bool = False,
-    confirm_within: int = 0,            # 0 = brak potwierdzenia C3
-    confirm_method: str = "high",       # 'high' (knot) lub 'close' (zamknięcie)
-    directions: Tuple[str, ...] = ("bullish", "bearish"),
+        df: pd.DataFrame,
+        lookback_bars: int = 30,
+        require_midline: bool = False,
+        strict_vs_c1open: bool = False,
+        confirm_within: int = 0,            # 0 = brak potwierdzenia C3
+        confirm_method: str = "high",       # 'high' (knot) lub 'close' (zamknięcie)
+        directions: Tuple[str, ...] = ("bullish", "bearish"),
 ) -> List[Dict]:
     """
     Zwraca listę setupów CRT (C1/C2/C3 + metadane).
@@ -430,6 +451,16 @@ with st.sidebar:
     st.subheader("Tryb szukania okazji")
     opportunity_mode = st.checkbox("Okazje C3 (ostatnie 2 tygodnie)", value=True,
                                    help="Pokaż układy, w których C2 było w jednym z dwóch ostatnich zamkniętych tygodni i C3 JESZCZE nie nastąpiło.")
+    st.session_state['opportunity_mode'] = opportunity_mode
+
+    st.divider()
+    st.subheader("Key Level (HTF)")
+    key_on = st.checkbox("Włącz Key Level (konfluencja HTF)", value=True)
+    key_tf_label = st.selectbox("TF poziomu", ["1M (miesięczny)", "3M (kwartalny)"], index=0, disabled=not key_on)
+    key_window_months = st.slider("Okno (miesiące)", 3, 36, 12, step=3, disabled=not key_on)
+    key_interact = st.selectbox("Interakcja z poziomem", ["C1 lub C2", "Tylko C1", "Tylko C2"], index=0, disabled=not key_on)
+    key_strict = st.selectbox("Reguła kontaktu", ["strict (<, >)", "touch (≤, ≥)"], index=0, disabled=not key_on)
+    key_require = st.checkbox("Wymagaj konfluencji (filtruj wyniki)", value=True, disabled=not key_on, help="Jeśli wyłączone – tylko adnotacja w tabeli.")
 
     st.divider()
     st.caption(
@@ -437,7 +468,8 @@ with st.sidebar:
         f"mWIG40:{st.session_state.CACHE_STATS['mwig40_runs']}  | "
         f"WIG(all):{st.session_state.CACHE_STATS['wig_all_runs']}  | "
         f"S&P500 fetch:{st.session_state.CACHE_STATS['sp500_fetch_runs']}  | "
-        f"OHLCV dl:{st.session_state.CACHE_STATS['load_weekly_ohlcv_runs']}"
+        f"OHLCV dl:{st.session_state.CACHE_STATS['load_weekly_ohlcv_runs']}  | "
+        f"HTF dl:{st.session_state.CACHE_STATS['load_htf_runs']}"
     )
 
     if st.button("🧹 Wyczyść cache"):
@@ -531,7 +563,7 @@ meta_map = edited_df.set_index("yahoo_ticker")[
 st.caption(f"Aktywnych tickerów: **{len(active_tickers)}** / {len(edited_df)}")
 
 # ─────────────────────────────────────────
-# SKANOWANIE CRT
+# SKANOWANIE CRT + Key Level (HTF)
 # ─────────────────────────────────────────
 if not active_tickers:
     st.info("Zaznacz przynajmniej jedną spółkę jako aktywną.")
@@ -556,6 +588,7 @@ for i, yt in enumerate(active_tickers, start=1):
                     "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
                     "C2L": np.nan, "C2H": np.nan, "C2C": np.nan, "C2 pos w C1%": np.nan, "Sweep": "-",
                     "Trigger": np.nan, "Stop": np.nan, "TP1": np.nan, "TP2": np.nan, "R:TP1": np.nan, "R:TP2": np.nan,
+                    "KeyTF": "-", "KeyLevel": np.nan, "KeyDate": pd.NaT, "Confluence": "-",
                 })
             continue
 
@@ -569,6 +602,13 @@ for i, yt in enumerate(active_tickers, start=1):
             directions=directions,
         )
 
+        # HTF data if needed
+        if key_on:
+            htf_interval = "1mo" if key_tf_label.startswith("1M") else "3mo"
+            htf_df = load_htf_ohlcv(yt, interval=htf_interval, period="max")
+        else:
+            htf_df = pd.DataFrame()
+
         if not setups:
             if not opportunity_mode:
                 rows.append({
@@ -579,6 +619,7 @@ for i, yt in enumerate(active_tickers, start=1):
                     "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
                     "C2L": np.nan, "C2H": np.nan, "C2C": np.nan, "C2 pos w C1%": np.nan, "Sweep": "-",
                     "Trigger": np.nan, "Stop": np.nan, "TP1": np.nan, "TP2": np.nan, "R:TP1": np.nan, "R:TP2": np.nan,
+                    "KeyTF": "-", "KeyLevel": np.nan, "KeyDate": pd.NaT, "Confluence": "-",
                 })
             continue
 
@@ -593,11 +634,39 @@ for i, yt in enumerate(active_tickers, start=1):
                     continue
 
             C1L, C1H = rec["C1_low"], rec["C1_high"]
+            C2L, C2H, C2C = rec["C2_low"], rec["C2_high"], rec["C2_close"]
             rng = (C1H - C1L) if pd.notna(C1H) and pd.notna(C1L) else np.nan
 
+            # Key Level (HTF)
+            key_tf_str = "-"
+            key_level_val = np.nan
+            key_date = pd.NaT
+            confluence = False
+
+            if key_on and not htf_df.empty:
+                bars_per = 1 if htf_interval == "1mo" else 3
+                n_bars = max(1, math.ceil(key_window_months / bars_per))
+                htf_hist = htf_df[htf_df.index <= c2_ts]
+                if not htf_hist.empty:
+                    win = htf_hist.tail(n_bars)
+                    if rec["direction"] == "BULL":
+                        key_level_val = float(win["Low"].min())
+                        key_date = win["Low"].idxmin()
+                        lows = [C1L] if key_interact == "Tylko C1" else [C2L] if key_interact == "Tylko C2" else [C1L, C2L]
+                        value = min(lows)
+                        confluence = (value < key_level_val) if key_strict.startswith("strict") else (value <= key_level_val)
+                    else:  # BEAR
+                        key_level_val = float(win["High"].max())
+                        key_date = win["High"].idxmax()
+                        highs = [C1H] if key_interact == "Tylko C1" else [C2H] if key_interact == "Tylko C2" else [C1H, C2H]
+                        value = max(highs)
+                        confluence = (value > key_level_val) if key_strict.startswith("strict") else (value >= key_level_val)
+                    key_tf_str = "1M" if htf_interval == "1mo" else "3M"
+
+            # Wyliczenia trigger/stop/tp
             if rec["direction"] == "BULL":
                 trigger = C1H
-                stop = rec["C2_low"]
+                stop = C2L
                 tp1 = C1H + 0.5 * rng if pd.notna(rng) else np.nan
                 tp2 = C1H + 1.0 * rng if pd.notna(rng) else np.nan
                 risk = trigger - stop if pd.notna(trigger) and pd.notna(stop) else np.nan
@@ -605,12 +674,16 @@ for i, yt in enumerate(active_tickers, start=1):
                 r_tp2 = (tp2 - trigger) / risk if pd.notna(risk) and risk > 0 and pd.notna(tp2) else np.nan
             else:
                 trigger = C1L
-                stop = rec["C2_high"]
+                stop = C2H
                 tp1 = C1L - 0.5 * rng if pd.notna(rng) else np.nan
                 tp2 = C1L - 1.0 * rng if pd.notna(rng) else np.nan
                 risk = stop - trigger if pd.notna(trigger) and pd.notna(stop) else np.nan
                 r_tp1 = (trigger - tp1) / risk if pd.notna(risk) and risk > 0 and pd.notna(tp1) else np.nan
                 r_tp2 = (trigger - tp2) / risk if pd.notna(risk) and risk > 0 and pd.notna(tp2) else np.nan
+
+            # Filtr na konfluencję (jeśli wymagany)
+            if key_on and key_require and not confluence:
+                continue
 
             rows.append({
                 "Ticker": yt,
@@ -625,7 +698,7 @@ for i, yt in enumerate(active_tickers, start=1):
                 "Zasada potwierdzenia": rec["confirm_rule"],
                 "C1L": round(C1L, 2), "C1H": round(C1H, 2),
                 "Mid(50%)": round(rec["C1_mid"], 2), "C1O": round(rec["C1_open"], 2),
-                "C2L": round(rec["C2_low"], 2), "C2H": round(rec["C2_high"], 2), "C2C": round(rec["C2_close"], 2),
+                "C2L": round(C2L, 2), "C2H": round(C2H, 2), "C2C": round(C2C, 2),
                 "C2 pos w C1%": round(100 * rec["C2_position_in_range"], 1) if pd.notna(rec["C2_position_in_range"]) else np.nan,
                 "Sweep": rec["swept_side"],
                 "Trigger": round(trigger, 2) if pd.notna(trigger) else np.nan,
@@ -634,6 +707,10 @@ for i, yt in enumerate(active_tickers, start=1):
                 "TP2": round(tp2, 2) if pd.notna(tp2) else np.nan,
                 "R:TP1": round(r_tp1, 2) if pd.notna(r_tp1) else np.nan,
                 "R:TP2": round(r_tp2, 2) if pd.notna(r_tp2) else np.nan,
+                "KeyTF": key_tf_str,
+                "KeyLevel": round(key_level_val, 2) if pd.notna(key_level_val) else np.nan,
+                "KeyDate": key_date.date() if pd.notna(key_date) else pd.NaT,
+                "Confluence": "TAK" if confluence else "NIE" if key_on else "-",
             })
 
     except Exception as e:
@@ -645,14 +722,15 @@ for i, yt in enumerate(active_tickers, start=1):
             "C1L": np.nan, "C1H": np.nan, "Mid(50%)": np.nan, "C1O": np.nan,
             "C2L": np.nan, "C2H": np.nan, "C2C": np.nan, "C2 pos w C1%": np.nan, "Sweep": "-",
             "Trigger": np.nan, "Stop": np.nan, "TP1": np.nan, "TP2": np.nan, "R:TP1": np.nan, "R:TP2": np.nan,
+            "KeyTF": "-", "KeyLevel": np.nan, "KeyDate": pd.NaT, "Confluence": "-",
         })
-
-progress.empty()
-out_df = pd.DataFrame(rows)
 
 # ─────────────────────────────────────────
 # WIDOK / SORT / EKSPORT
 # ─────────────────────────────────────────
+progress.empty()
+out_df = pd.DataFrame(rows)
+
 if not out_df.empty:
     out_df["C2_sort"] = pd.to_datetime(out_df["C2"], errors="coerce")
     if opportunity_mode:
@@ -675,11 +753,14 @@ if not out_df.empty:
 else:
     st.info("Brak wyników dla bieżących ustawień.")
 
-with st.expander("ℹ️ Uwaga dot. 'high' vs 'close' w potwierdzeniu"):
+with st.expander("ℹ️ Uwaga dot. 'high' vs 'close' w potwierdzeniu + Key Level"):
     st.markdown(
         """
 - **high** – potwierdzenie knotem: BULL = `High > C1H`, BEAR = `Low < C1L`  
 - **close** – potwierdzenie zamknięciem: BULL = `Close > C1H`, BEAR = `Close < C1L`  
+- **Key Level (HTF)**: BULL porównuje `C1/C2 Low` do **minimum** z okna N świec HTF, BEAR porównuje `C1/C2 High` do **maksimum**.  
+  - **strict**: `<` / `>`; **touch**: `≤` / `≥`  
+  - TF: **1M** (miesięczny) lub **3M** (kwartalny, świece 3-miesięczne).  
 W trybie „Okazje C3” filtrujemy **C3_happened==NIE** (do **końca serii**), niezależnie od tego,
 czy potwierdzenie w N świec jest włączone.
 """
