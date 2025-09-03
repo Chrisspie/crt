@@ -3,6 +3,56 @@ from __future__ import annotations
 from typing import Dict, Any
 import pandas as pd, plotly.graph_objects as go
 
+
+_YAHOO_TV_SUFFIX_MAP = {
+    ".WA": "GPW",
+}
+
+
+def yahoo_to_tv_symbol(symbol: str) -> str:
+    """Convert a Yahoo Finance ticker to TradingView notation.
+
+    Parameters
+    ----------
+    symbol:
+        Ticker in Yahoo format, e.g. ``PKN.WA``.
+
+    Returns
+    -------
+    str
+        TradingView formatted symbol, e.g. ``GPW:PKN``.
+    """
+
+    if "." in symbol:
+        ticker, suffix = symbol.split(".", 1)
+        exchange = _YAHOO_TV_SUFFIX_MAP.get(f".{suffix}")
+        if exchange:
+            return f"{exchange}:{ticker}"
+    return symbol
+
+
+def tradingview_embed_html(symbol: str, height: int = 520, interval: str = "D") -> str:
+    """Return HTML snippet for embedding a TradingView chart.
+
+    The snippet loads the official ``tv.js`` script and initialises the widget
+    using the provided parameters.
+    """
+
+    return f"""
+<div class=\"tradingview-widget-container\">
+  <div id=\"tv_chart_container\"></div>
+  <script type=\"text/javascript\" src=\"https://s3.tradingview.com/tv.js\"></script>
+  <script type=\"text/javascript\">
+  new TradingView.widget({{
+      \"symbol\": \"{symbol}\",
+      \"interval\": \"{interval}\",
+      \"container_id\": \"tv_chart_container\",
+      \"height\": {height}
+  }});
+  </script>
+</div>
+""".strip()
+
 def build_plotly_chart(d: pd.DataFrame, rec: Dict[str, Any], ticker: str) -> go.Figure:
     fig = go.Figure(data=[go.Candlestick(x=d.index, open=d['Open'], high=d['High'], low=d['Low'], close=d['Close'], name=ticker)])
     def add_hline(y, text, dash="dot"):
