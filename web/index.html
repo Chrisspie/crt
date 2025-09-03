@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CRT Scanner – Web</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>⚡ CRT Scanner – FAST + Web</h1>
+      <p class="caption">WIG / mWIG40 / US — weekly CRT scan with optional HTF key level confluence.</p>
+    </header>
+
+    <main>
+      <section class="panel">
+        <h2>Data & CRT</h2>
+        <div class="grid">
+          <div class="card">
+            <h3>Indeksy GPW</h3>
+            <label><input type="checkbox" id="use_wig_all" /> WIG</label>
+            <label><input type="checkbox" id="use_wig20" checked /> WIG20</label>
+            <label><input type="checkbox" id="use_mwig40" checked /> mWIG40</label>
+          </div>
+          <div class="card">
+            <h3>Polska (GPW)</h3>
+            <textarea id="gpw_raw" placeholder="PKN, KGH, PKO…" rows="4"></textarea>
+          </div>
+          <div class="card">
+            <h3>Amerykańskie spółki (US)</h3>
+            <label><input type="checkbox" id="use_sp500" /> Dołącz spółki z S&amp;P500 (cache 7d)</label>
+            <textarea id="raw_us" placeholder="AAPL, MSFT, NVDA" rows="4"></textarea>
+          </div>
+          <div class="card">
+            <h3>Zakres danych</h3>
+            <label>Okres historii (1wk)
+              <select id="period">
+                <option value="2y">2y</option>
+                <option value="5y" selected>5y</option>
+                <option value="10y">10y</option>
+                <option value="max">max</option>
+              </select>
+            </label>
+          </div>
+          <div class="card">
+            <h3>Parametry CRT</h3>
+            <label>Kierunek
+              <select id="directions">
+                <option value="both" selected>Bycze + Niedźwiedzie</option>
+                <option value="bullish">Tylko bycze</option>
+                <option value="bearish">Tylko niedźwiedzie</option>
+              </select>
+            </label>
+            <label>Lookback (tygodnie)
+              <input type="number" id="lookback_bars" min="10" max="120" step="5" value="40" />
+            </label>
+            <label><input type="checkbox" id="require_midline" /> Wymagaj midline 50% (C2C po właściwej stronie)</label>
+            <label><input type="checkbox" id="strict_vs_c1open" /> Surowszy wariant (C2C vs C1O)</label>
+          </div>
+          <div class="card">
+            <h3>Potwierdzenie C3</h3>
+            <label><input type="checkbox" id="confirm_on" checked /> Wymagaj potwierdzenia C3</label>
+            <label>C3 w ≤ X świec
+              <input type="number" id="confirm_within" min="1" max="8" step="1" value="3" />
+            </label>
+            <label>Sposób potwierdzenia
+              <select id="confirm_method">
+                <option value="high" selected>high</option>
+                <option value="close">close</option>
+              </select>
+            </label>
+          </div>
+          <div class="card">
+            <h3>Tryb szukania okazji</h3>
+            <label><input type="checkbox" id="opportunity_mode" checked /> Okazje C3 (ostatnie 2 tygodnie)</label>
+          </div>
+          <div class="card">
+            <h3>Key Level (HTF)</h3>
+            <label><input type="checkbox" id="key_on" checked /> Włącz Key Level (konfluencja HTF)</label>
+            <label>TF poziomu
+              <select id="key_tf_label">
+                <option value="1mo" selected>1M (miesięczny)</option>
+                <option value="3mo">3M (kwartalny)</option>
+              </select>
+            </label>
+            <label>Okno (miesiące)
+              <input type="number" id="key_window_months" min="3" max="36" step="3" value="12" />
+            </label>
+            <label>Interakcja z poziomem
+              <select id="key_interact">
+                <option value="C1 lub C2" selected>C1 lub C2</option>
+                <option value="Tylko C1">Tylko C1</option>
+                <option value="Tylko C2">Tylko C2</option>
+              </select>
+            </label>
+            <label>Reguła kontaktu
+              <select id="key_strict">
+                <option value="strict" selected>strict (&lt;, &gt;)</option>
+                <option value="touch">touch (≤, ≥)</option>
+              </select>
+            </label>
+            <label><input type="checkbox" id="key_require" checked /> Wymagaj konfluencji (filtruj wyniki)</label>
+          </div>
+        </div>
+        <div class="buttons">
+          <button id="btn_build_universe">Zbuduj listę spółek</button>
+          <button id="btn_clear_cache" title="Clear downloaded data cache">🧹 Wyczyść cache</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Panel aktywnych spółek</h2>
+        <div class="buttons">
+          <button id="btn_select_all">Zaznacz wszystkie</button>
+          <button id="btn_unselect_all">Odznacz wszystkie</button>
+          <span id="active_count" class="muted"></span>
+        </div>
+        <div id="universe_table" class="table"></div>
+      </section>
+
+      <section class="panel">
+        <div class="flex-row space-between">
+          <h2>Wyniki skanowania CRT (tygodnie)</h2>
+          <div>
+            <button id="btn_scan">Skanuj</button>
+            <a id="btn_download_csv" download class="button secondary" href="#" style="display:none">📥 Pobierz CSV</a>
+          </div>
+        </div>
+        <div id="scan_progress" class="muted"></div>
+        <div id="failed_info" class="muted"></div>
+        <div id="results_table" class="table"></div>
+      </section>
+
+      <section class="panel">
+        <div class="flex-row space-between">
+          <h2>Wykres (W1, z poziomami)</h2>
+          <div>
+            <label>Wybierz ticker: <select id="chart_ticker"></select></label>
+          </div>
+        </div>
+        <div id="chart" class="chart"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span>Local, client-side app. Data from Yahoo Finance / Wikipedia (if available). No server.</span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+  </html>
+

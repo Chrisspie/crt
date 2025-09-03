@@ -4,3 +4,4 @@ numpy>=1.24
 yfinance>=0.2.40
 requests>=2.31
 lxml>=4.9
+plotly>=5.18
