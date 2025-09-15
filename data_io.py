@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import datetime as dt
+from collections import OrderedDict
 from typing import List, Dict, Tuple
 import pandas as pd, numpy as np, yfinance as yf, requests, streamlit as st
 from io import StringIO
@@ -21,6 +23,109 @@ STOOQ_INTERVAL_MAP = {
     "1mo": "m",
     "3mo": "q",
 }
+
+DATA_SOURCE_SPECS: Dict[str, Dict[str, object]] = OrderedDict(
+    [
+        ("yahoo", {"label": "Yahoo Finance (yfinance)", "supports_batch": True}),
+        ("stooq", {"label": "Stooq.pl CSV", "supports_batch": False}),
+    ]
+)
+
+DEFAULT_SOURCE_PRIORITY: List[str] = list(DATA_SOURCE_SPECS.keys())
+_CACHE_REGISTRY_KEY = "_data_cache_registry"
+
+
+def get_available_data_sources() -> OrderedDict:
+    """Return metadata about supported free data sources."""
+    return OrderedDict(DATA_SOURCE_SPECS)
+
+
+def get_default_source_priority() -> List[str]:
+    return DEFAULT_SOURCE_PRIORITY[:]
+
+
+def normalize_source_priority(priority: List[str] | None) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for src in priority or []:
+        if src in DATA_SOURCE_SPECS and src not in seen:
+            out.append(src); seen.add(src)
+    for src in DEFAULT_SOURCE_PRIORITY:
+        if src not in seen:
+            out.append(src); seen.add(src)
+    return out
+
+
+def source_display_name(source: str) -> str:
+    spec = DATA_SOURCE_SPECS.get(source, {})
+    return str(spec.get("label", source))
+
+
+def _ensure_cache_registry() -> Dict[Tuple[str, str], Dict[str, object]]:
+    if _CACHE_REGISTRY_KEY not in st.session_state:
+        st.session_state[_CACHE_REGISTRY_KEY] = {}
+    return st.session_state[_CACHE_REGISTRY_KEY]
+
+
+def clear_cache_registry() -> None:
+    st.session_state.pop(_CACHE_REGISTRY_KEY, None)
+
+
+def _record_cache_entry(
+    *,
+    ticker: str,
+    interval: str,
+    df: pd.DataFrame,
+    source: str,
+    period: str | None,
+    start: str | None,
+) -> None:
+    if df is None or df.empty:
+        return
+    registry = _ensure_cache_registry()
+    try:
+        idx = pd.to_datetime(df.index)
+    except Exception:
+        idx = df.index
+    first = pd.to_datetime(idx.min(), errors="coerce")
+    last = pd.to_datetime(idx.max(), errors="coerce")
+    registry[(ticker, interval)] = {
+        "ticker": ticker,
+        "interval": interval,
+        "source": source_display_name(source),
+        "rows": int(len(df)),
+        "first": first.date().isoformat() if pd.notna(first) else "-",
+        "last": last.date().isoformat() if pd.notna(last) else "-",
+        "param_period": period or "-",
+        "param_start": start or "-",
+        "updated": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def get_cache_inventory() -> pd.DataFrame:
+    registry = _ensure_cache_registry()
+    if not registry:
+        return pd.DataFrame(columns=["Ticker", "TF", "Źródło", "Wiersze", "Zakres", "Parametry", "Aktualizacja"])
+    rows = []
+    for meta in registry.values():
+        rows.append(
+            {
+                "Ticker": meta.get("ticker", "-"),
+                "TF": meta.get("interval", "-"),
+                "Źródło": meta.get("source", "-"),
+                "Wiersze": meta.get("rows", 0),
+                "Zakres": f"{meta.get('first','-')} → {meta.get('last','-')}",
+                "Parametry": f"start={meta.get('param_start','-')}, period={meta.get('param_period','-')}",
+                "Aktualizacja": meta.get("updated", "-"),
+            }
+        )
+    df = pd.DataFrame(rows)
+    return df.sort_values(by=["TF", "Ticker"], ascending=[True, True], ignore_index=True)
+
+
+def clear_all_cached_data() -> None:
+    st.cache_data.clear()
+    clear_cache_registry()
 
 
 def _yahoo_to_stooq_symbol(yahoo_ticker: str) -> str | None:
@@ -59,6 +164,45 @@ def _limit_history(df: pd.DataFrame, *, start: str | None, period: str | None) -
         cutoff = now - offset
         out = out.loc[out.index >= cutoff]
     return out
+
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def _yahoo_download_many_cached(
+    tickers: Tuple[str, ...],
+    *,
+    interval: str,
+    period: str | None,
+    start: str | None,
+) -> pd.DataFrame:
+    kwargs = dict(interval=interval, auto_adjust=False, progress=False, threads=YF_THREADS)
+    try:
+        if start:
+            return yf.download(list(tickers), start=start, **kwargs)
+        return yf.download(list(tickers), period=period or "max", **kwargs)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=60*60*12, show_spinner=False)
+def _yahoo_download_single_cached(
+    ticker: str,
+    *,
+    interval: str,
+    period: str | None,
+    start: str | None,
+) -> pd.DataFrame:
+    kwargs = dict(interval=interval, auto_adjust=False, progress=False, threads=YF_THREADS)
+    try:
+        if start:
+            data = yf.download(ticker, start=start, **kwargs)
+        else:
+            data = yf.download(ticker, period=period or "max", **kwargs)
+    except Exception:
+        data = pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.copy()
+        data.columns = data.columns.get_level_values(0)
+    return data
 
 
 def fetch_stooq_ohlcv(
@@ -171,122 +315,181 @@ def fetch_sp500_companies() -> pd.DataFrame:
     except Exception:
         df=pd.DataFrame({"yahoo_ticker":SP500_FALLBACK}); df["company"]=df["yahoo_ticker"]; df["group"]="S&P500"; return df[["company","yahoo_ticker","group"]]
 
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_weekly_ohlcv(yahoo_ticker: str, period: str = "5y") -> pd.DataFrame:
-    try:
-        df = yf.download(yahoo_ticker, interval="1wk", period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
-    except Exception:
-        df = pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if not df.empty:
-        df = df.dropna(subset=["Open","High","Low","Close"])
-    if df.empty:
-        fallback = fetch_stooq_ohlcv(yahoo_ticker, interval="1wk", period=period)
-        if not fallback.empty:
-            return fallback
-    return df
+def load_weekly_ohlcv(
+    yahoo_ticker: str,
+    period: str = "5y",
+    *,
+    start: str | None = None,
+    source_priority: List[str] | None = None,
+) -> pd.DataFrame:
+    data_map = load_many_weekly_ohlcv(
+        [yahoo_ticker],
+        period=period,
+        start=start,
+        retries=1,
+        source_priority=source_priority,
+    )
+    return data_map.get(yahoo_ticker, pd.DataFrame())
 
 def _extract_single(df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in ["Open","High","Low","Close"] if c in df.columns]
-    if not cols: return pd.DataFrame()
-    return df[cols].dropna(subset=cols)
-
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_many_weekly_ohlcv(tickers: list[str], *, period: str = "5y", start: str | None = None, retries: int = 1) -> Dict[str, pd.DataFrame]:
-    if not tickers: return {}
-    uniq = sorted(set([t for t in tickers if t]))
-    if not uniq: return {}
-    kwargs = dict(interval="1wk", auto_adjust=False, progress=False, threads=True)
-    try:
-        df = yf.download(uniq, start=start, **kwargs) if start else yf.download(uniq, period=period, **kwargs)
-    except Exception:
-        df = pd.DataFrame()
-    out: Dict[str, pd.DataFrame] = {}
-    missing = set(uniq)
+    if df is None or df.empty:
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
-        top = df.columns.get_level_values(0)
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    cols = [c for c in ["Open","High","Low","Close"] if c in df.columns]
+    if not cols:
+        return pd.DataFrame()
+    sub = df[cols]
+    try:
+        return sub.dropna(subset=cols)
+    except KeyError:
+        # Fallback when pandas complains about subset on unexpected column index
+        return sub.dropna(how="any")
+
+
+def _load_many_from_yahoo(
+    tickers: List[str],
+    *,
+    interval: str,
+    period: str | None,
+    start: str | None,
+    retries: int,
+) -> Tuple[Dict[str, pd.DataFrame], set[str]]:
+    uniq = sorted(set([t for t in tickers if t]))
+    if not uniq:
+        return {}, set()
+    bulk = _yahoo_download_many_cached(tuple(uniq), interval=interval, period=period, start=start)
+    out: Dict[str, pd.DataFrame] = {}
+    missing: set[str] = set(uniq)
+    if isinstance(bulk.columns, pd.MultiIndex):
+        top = bulk.columns.get_level_values(0)
         for t in uniq:
             if t in top:
-                sub = _extract_single(df[t])
-                if not sub.empty:
-                    out[t] = sub; 
-                    if t in missing: missing.remove(t)
-    elif not df.empty and len(uniq)==1:
-        sub = _extract_single(df)
-        if not sub.empty:
-            out[uniq[0]] = sub; missing.discard(uniq[0])
-    # Retry individually for missing tickers
-    if missing and retries>0:
-        for t in list(missing):
-            try:
-                df1 = yf.download(t, start=start, **kwargs) if start else yf.download(t, period=period, **kwargs)
-                sub = _extract_single(df1)
+                sub = _extract_single(bulk[t])
                 if not sub.empty:
                     out[t] = sub; missing.discard(t)
-            except Exception:
-                pass
-    if missing:
+    elif not bulk.empty and len(uniq) == 1:
+        sub = _extract_single(bulk)
+        if not sub.empty:
+            out[uniq[0]] = sub; missing.discard(uniq[0])
+    if missing and retries > 0:
         for t in list(missing):
-            fallback = fetch_stooq_ohlcv(t, interval="1wk", start=start, period=period)
-            if not fallback.empty:
-                out[t] = fallback; missing.discard(t)
-    # Return dict plus list of failed for UI
+            single = _yahoo_download_single_cached(t, interval=interval, period=period, start=start)
+            sub = _extract_single(single)
+            if not sub.empty:
+                out[t] = sub; missing.discard(t)
+    return out, missing
+
+def load_many_weekly_ohlcv(
+    tickers: list[str],
+    *,
+    period: str = "5y",
+    start: str | None = None,
+    retries: int = 1,
+    source_priority: List[str] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    uniq = sorted(set([t for t in tickers if t]))
+    missing: set[str] = set(uniq)
+    priority = normalize_source_priority(source_priority)
+    for source in priority:
+        if not missing:
+            break
+        if source == "yahoo":
+            fetched, missing = _load_many_from_yahoo(
+                list(missing), interval="1wk", period=period, start=start, retries=retries
+            )
+            for ticker, df in fetched.items():
+                out[ticker] = df
+                _record_cache_entry(
+                    ticker=ticker,
+                    interval="1wk",
+                    df=df,
+                    source=source,
+                    period=period,
+                    start=start,
+                )
+        elif source == "stooq":
+            for ticker in list(missing):
+                fallback = fetch_stooq_ohlcv(ticker, interval="1wk", start=start, period=period)
+                if not fallback.empty:
+                    out[ticker] = fallback
+                    _record_cache_entry(
+                        ticker=ticker,
+                        interval="1wk",
+                        df=fallback,
+                        source=source,
+                        period=period,
+                        start=start,
+                    )
+                    missing.discard(ticker)
+        else:
+            continue
     out["__failed__"] = pd.Series(sorted(missing)) if missing else pd.Series([], dtype=str)
     return out
 
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_htf_ohlcv(yahoo_ticker: str, interval: str = "1mo", period: str = "max") -> pd.DataFrame:
-    try:
-        df = yf.download(yahoo_ticker, interval=interval, period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
-    except Exception:
-        df = pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    if not df.empty:
-        df = df.dropna(subset=["Open","High","Low","Close"])
-    if df.empty:
-        fallback = fetch_stooq_ohlcv(yahoo_ticker, interval=interval, period=period)
-        if not fallback.empty:
-            return fallback
-    return df
+def load_htf_ohlcv(
+    yahoo_ticker: str,
+    *,
+    interval: str = "1mo",
+    period: str = "max",
+    source_priority: List[str] | None = None,
+) -> pd.DataFrame:
+    data_map = load_many_htf_ohlcv(
+        [yahoo_ticker],
+        interval=interval,
+        period=period,
+        retries=1,
+        source_priority=source_priority,
+    )
+    return data_map.get(yahoo_ticker, pd.DataFrame())
 
-@st.cache_data(ttl=60*60*12, show_spinner=False)
-def load_many_htf_ohlcv(tickers: list[str], *, interval: str = "1mo", period: str = "max", retries: int = 1) -> Dict[str, pd.DataFrame]:
-    if not tickers: return {}
-    uniq = sorted(set([t for t in tickers if t]))
-    if not uniq: return {}
-    kwargs = dict(interval=interval, auto_adjust=False, progress=False, threads=True)
-    try:
-        df = yf.download(uniq, period=period, **kwargs)
-    except Exception:
-        df = pd.DataFrame()
+
+def load_many_htf_ohlcv(
+    tickers: list[str],
+    *,
+    interval: str = "1mo",
+    period: str = "max",
+    retries: int = 1,
+    source_priority: List[str] | None = None,
+) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
-    missing = set(uniq)
-    if isinstance(df.columns, pd.MultiIndex):
-        top = df.columns.get_level_values(0)
-        for t in uniq:
-            if t in top:
-                sub = _extract_single(df[t])
-                if not sub.empty:
-                    out[t] = sub; missing.discard(t)
-    elif not df.empty and len(uniq)==1:
-        sub = _extract_single(df)
-        if not sub.empty:
-            out[uniq[0]] = sub; missing.discard(uniq[0])
-    if missing and retries>0:
-        for t in list(missing):
-            try:
-                df1 = yf.download(t, period=period, **kwargs)
-                sub = _extract_single(df1)
-                if not sub.empty:
-                    out[t] = sub; missing.discard(t)
-            except Exception:
-                pass
-    if missing:
-        for t in list(missing):
-            fallback = fetch_stooq_ohlcv(t, interval=interval, period=period)
-            if not fallback.empty:
-                out[t] = fallback; missing.discard(t)
+    uniq = sorted(set([t for t in tickers if t]))
+    missing: set[str] = set(uniq)
+    priority = normalize_source_priority(source_priority)
+    for source in priority:
+        if not missing:
+            break
+        if source == "yahoo":
+            fetched, missing = _load_many_from_yahoo(
+                list(missing), interval=interval, period=period, start=None, retries=retries
+            )
+            for ticker, df in fetched.items():
+                out[ticker] = df
+                _record_cache_entry(
+                    ticker=ticker,
+                    interval=interval,
+                    df=df,
+                    source=source,
+                    period=period,
+                    start=None,
+                )
+        elif source == "stooq":
+            for ticker in list(missing):
+                fallback = fetch_stooq_ohlcv(ticker, interval=interval, period=period)
+                if not fallback.empty:
+                    out[ticker] = fallback
+                    _record_cache_entry(
+                        ticker=ticker,
+                        interval=interval,
+                        df=fallback,
+                        source=source,
+                        period=period,
+                        start=None,
+                    )
+                    missing.discard(ticker)
+        else:
+            continue
     out["__failed__"] = pd.Series(sorted(missing)) if missing else pd.Series([], dtype=str)
     return out

@@ -4,6 +4,7 @@ from pandas import MultiIndex
 import data_io
 
 def test_load_many_weekly_ohlcv_multi(monkeypatch):
+    data_io.clear_all_cached_data()
     idx = pd.date_range("2024-01-05", periods=5, freq="W-FRI")
     cols = MultiIndex.from_product([["AAA","BBB"], ["Open","High","Low","Close"]])
     df = pd.DataFrame(np.random.rand(len(idx), len(cols)), index=idx, columns=cols)
@@ -13,6 +14,7 @@ def test_load_many_weekly_ohlcv_multi(monkeypatch):
     assert set(out.keys()) >= {"AAA","BBB"}
 
 def test_load_many_weekly_ohlcv_reports_missing(monkeypatch):
+    data_io.clear_all_cached_data()
     idx = pd.date_range("2024-01-05", periods=4, freq="W-FRI")
     cols = MultiIndex.from_product([["AAA"], ["Open","High","Low","Close"]])
     df = pd.DataFrame(np.random.rand(len(idx), len(cols)), index=idx, columns=cols)
@@ -29,6 +31,7 @@ def test_load_many_weekly_ohlcv_reports_missing(monkeypatch):
 
 
 def test_load_many_weekly_ohlcv_bulk_retry(monkeypatch):
+    data_io.clear_all_cached_data()
     idx = pd.date_range("2024-01-05", periods=3, freq="W-FRI")
     base = pd.DataFrame(
         {
@@ -57,6 +60,7 @@ def test_load_many_weekly_ohlcv_bulk_retry(monkeypatch):
 
 
 def test_load_many_weekly_single_ticker(monkeypatch):
+    data_io.clear_all_cached_data()
     idx = pd.date_range("2024-01-05", periods=3, freq="W-FRI")
     df = pd.DataFrame(
         {
@@ -79,6 +83,7 @@ def test_load_many_weekly_single_ticker(monkeypatch):
 
 
 def test_load_many_htf_multi(monkeypatch):
+    data_io.clear_all_cached_data()
     idx = pd.date_range("2023-01-31", periods=3, freq="ME")
     cols = MultiIndex.from_product([["AAA"], ["Open", "High", "Low", "Close"]])
     df = pd.DataFrame(np.random.rand(len(idx), len(cols)), index=idx, columns=cols)
@@ -115,7 +120,7 @@ def test_fetch_wiki_table_returns_empty_on_failure(monkeypatch):
 
 
 def test_load_many_weekly_ohlcv_stooq_fallback(monkeypatch):
-    data_io.load_many_weekly_ohlcv.clear()
+    data_io.clear_all_cached_data()
 
     def fake_download(*args, **kwargs):
         return pd.DataFrame()
@@ -151,7 +156,7 @@ def test_load_many_weekly_ohlcv_stooq_fallback(monkeypatch):
 
 
 def test_load_many_htf_ohlcv_stooq_fallback(monkeypatch):
-    data_io.load_many_htf_ohlcv.clear()
+    data_io.clear_all_cached_data()
 
     def fake_download(*args, **kwargs):
         return pd.DataFrame()

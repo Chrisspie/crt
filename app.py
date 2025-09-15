@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import datetime as dt, numpy as np, pandas as pd, streamlit as st
-from data_io import load_many_weekly_ohlcv, load_many_htf_ohlcv, load_weekly_ohlcv
+import streamlit.components.v1 as components
+from data_io import (
+    load_many_weekly_ohlcv,
+    load_many_htf_ohlcv,
+    load_weekly_ohlcv,
+    get_available_data_sources,
+    get_default_source_priority,
+    normalize_source_priority,
+    get_cache_inventory,
+    source_display_name,
+    clear_all_cached_data,
+)
 from universe import build_universe_df
 from crt_core import crt_scan, get_key_level_and_confluence
 from tv_chart import build_plotly_chart
@@ -10,6 +21,54 @@ from datetime import date, timedelta
 st.set_page_config(page_title="CRT Scanner – FAST+FIX (HTF touch default)", layout="wide")
 st.title("⚡ CRT Scanner – FAST + HTF (touch)")
 st.caption("HTF konfluencja: najbliższy poziom (Open/Close/Low/High) z tolerancją. Domyślnie: touch (1%).")
+
+
+st.session_state.setdefault("show_data_settings", False)
+st.session_state.setdefault("data_source_priority", get_default_source_priority())
+st.session_state["data_source_priority"] = normalize_source_priority(st.session_state["data_source_priority"])
+
+def _toggle_data_settings() -> None:
+    st.session_state["show_data_settings"] = not st.session_state.get("show_data_settings", False)
+
+top_cols = st.columns([3, 1])
+with top_cols[1]:
+    st.button("⚙️ Ustawienia danych", on_click=_toggle_data_settings)
+
+if st.session_state.get("show_data_settings", False):
+    with st.container(border=True):
+        st.subheader("Ustawienia danych i cache")
+        sources_meta = get_available_data_sources()
+        st.markdown(
+            """**Aktualnie używane darmowe źródła:**
+- **Yahoo Finance (yfinance)** – szerokie pokrycie globalnych spółek, darmowe API (limitowane prędkością).
+- **Stooq.pl** – bezpłatne dane dzienne/tygodniowe dla GPW i wybranych indeksów, świetne jako fallback.
+
+Inne darmowe alternatywy (wymagają własnego klucza API lub mają ostrzejsze limity): Alpha Vantage, Twelve Data, Finnhub.
+"""
+        )
+        available_keys = list(sources_meta.keys())
+        current_priority = normalize_source_priority(st.session_state.get("data_source_priority"))
+        primary = st.radio(
+            "Preferowane źródło (pierwsze w kolejce)",
+            options=available_keys,
+            format_func=lambda k: str(sources_meta[k]["label"]),
+            index=available_keys.index(current_priority[0]) if current_priority else 0,
+            key="data_source_primary",
+        )
+        ordered = [primary] + [key for key in available_keys if key != primary]
+        st.session_state["data_source_priority"] = ordered
+        if len(ordered) > 1:
+            st.caption("Fallback: " + ", ".join(source_display_name(k) for k in ordered[1:]))
+
+        cache_df = get_cache_inventory()
+        st.markdown("**Cache danych**")
+        if cache_df.empty:
+            st.info("Cache jest pusty – brak pobranych zestawów.")
+        else:
+            st.dataframe(cache_df, use_container_width=True, height=min(420, 80 + 26 * len(cache_df)))
+
+current_source_priority = normalize_source_priority(st.session_state.get("data_source_priority"))
+
 
 with st.sidebar:
     st.header("⚙️ Dane & CRT")
@@ -62,10 +121,11 @@ with st.sidebar:
 
     st.divider()
     if st.button("🧹 Wyczyść cache"):
-        st.cache_data.clear(); st.success("Cache wyczyszczony."); st.rerun()
+        clear_all_cached_data(); st.success("Cache wyczyszczony."); st.rerun()
 
 st.session_state.setdefault("active_map", {})
-universe_df = build_universe_df(use_wig_all, use_wig20, use_mwig40, use_sp500, gpw_raw, raw_us)
+with st.spinner("Ładowanie listy tickerów…"):
+    universe_df = build_universe_df(use_wig_all, use_wig20, use_mwig40, use_sp500, gpw_raw, raw_us)
 if universe_df.empty:
     st.warning("Brak spółek do skanowania."); st.stop()
 
@@ -123,6 +183,8 @@ if not state or not state.get("running"):
     start_scan = st.button("Rozpocznij skanowanie")
     logs_box = emit_logs(expanded=False)
     if start_scan:
+        logs_box.empty()
+        source_priority_current = current_source_priority[:]
         tickers = active_tickers[:]
         params = dict(
             directions=directions, lookback_bars=lookback_bars, require_midline=require_midline,
@@ -132,25 +194,34 @@ if not state or not state.get("running"):
             key_on=key_on, key_tf=("1mo" if key_tf_label.startswith("1M") else "3mo"),
             key_window_months=int(key_window_months), key_interact=key_interact, key_rule_label=key_rule_label,
             key_require=bool(key_require),
+            data_sources=source_priority_current,
         )
         # Prepare data in advance
-        if params["opportunity_mode"]:
-            effective_weeks = 2 + params["confirm_within"] + 6 if params["confirm_on"] else 2 + 6
-            start_date = (date.today() - timedelta(weeks=effective_weeks)).isoformat()
-            data_map = load_many_weekly_ohlcv(tickers, period="max", start=start_date, retries=1)
-            effective_lookback = 3
-            log_first = f"Start skanowania (opportunity). Tickerów: {len(tickers)}. Start: {start_date}."
-        else:
-            data_map = load_many_weekly_ohlcv(tickers, period=params["period"], retries=1)
-            effective_lookback = params["lookback_bars"]
-            log_first = f"Start skanowania ({params['period']}). Tickerów: {len(tickers)}."
-        htf_map = load_many_htf_ohlcv(tickers, interval=(params["key_tf"]), period="max", retries=1) if params["key_on"] else {}
+        data_progress = st.progress(0.0, text="📦 Przygotowywanie danych do skanu…")
+        with st.spinner("Ładowanie danych dla skanu…"):
+            if params["opportunity_mode"]:
+                effective_weeks = 2 + params["confirm_within"] + 6 if params["confirm_on"] else 2 + 6
+                start_date = (date.today() - timedelta(weeks=effective_weeks)).isoformat()
+                data_map = load_many_weekly_ohlcv(tickers, period="max", start=start_date, retries=1, source_priority=source_priority_current)
+                log_first = f"Start skanowania (opportunity). Tickerów: {len(tickers)}. Start: {start_date}."
+            else:
+                data_map = load_many_weekly_ohlcv(tickers, period=params["period"], retries=1, source_priority=source_priority_current)
+                log_first = f"Start skanowania ({params['period']}). Tickerów: {len(tickers)}."
+            data_progress.progress(0.6, text="⬆️ Wczytywanie danych HTF…")
+            htf_map = load_many_htf_ohlcv(tickers, interval=(params["key_tf"]), period="max", retries=1, source_priority=source_priority_current) if params["key_on"] else {}
+        data_progress.progress(1.0, text="✅ Dane załadowane.")
+        data_progress.empty()
 
         # Build initial state
+        source_names = ", ".join(source_display_name(src) for src in source_priority_current)
+        log_lines = [
+            f"[{dt.datetime.now().strftime('%H:%M:%S')}] {log_first}",
+            f"[{dt.datetime.now().strftime('%H:%M:%S')}] Źródła danych (priorytet): {source_names}",
+        ]
         st.session_state["scan_state"] = {
             "running": True, "cancel": False,
             "idx": 0, "total": len(tickers), "tickers": tickers,
-            "rows": [], "logs": [f"[{dt.datetime.now().strftime('%H:%M:%S')}] {log_first}"],
+            "rows": [], "logs": log_lines,
             "params": params, "data_map": data_map, "htf_map": htf_map,
         }
         # Report failures
@@ -177,114 +248,115 @@ else:
     i, total = state.get("idx", 0), state.get("total", 0)
     progress = st.progress(i/max(1,total), text=(f"Skanowanie: {i}/{total}"))
 
-    # Finalize if cancelled or done
-    if state.get("cancel") or i >= total:
-        out_df = pd.DataFrame(state.get("rows", []))
-        state["running"] = False
-        st.session_state["scan_state"] = state
-        if not out_df.empty:
-            out_df["C2_sort"] = pd.to_datetime(out_df["C2"], errors="coerce")
-            out_df = out_df.sort_values(by=["C2_sort","Grupa","Ticker"], ascending=[False,True,True]).drop(columns=["C2_sort"])
-            st.dataframe(out_df, use_container_width=True, height=560)
-            st.download_button("📥 Pobierz wyniki (CSV)", data=out_df.to_csv(index=False).encode("utf-8"),
-                               file_name=f"crt_scan_{dt.date.today().isoformat()}.csv", mime="text/csv")
-            log_msg("Zakończono skanowanie." if not state.get("cancel") else "Skanowanie przerwane.")
-        else:
-            st.info("Brak wyników dla bieżących ustawień.")
-            log_msg("Zakończono skanowanie: brak wyników." if not state.get("cancel") else "Skanowanie przerwane: brak wyników.")
-        # Cache for chart section
-        st.session_state["scan_out_df"] = out_df
-    else:
-        # Process one ticker per run
-        yt = state["tickers"][i]
-        params = state["params"]; data_map = state["data_map"]; htf_map = state["htf_map"]
-        progress.progress(i/max(1,total), text=f"Skanowanie: {yt} ({i+1}/{total})")
-        log_msg(f"Skanuję: {yt}…")
-        try:
-            df = data_map.get(yt)
-            if df is None or df.empty or len(df) < 5:
-                log_msg(f"Pominięto (brak danych): {yt}")
+    with st.spinner("Skanowanie w toku…"):
+        # Finalize if cancelled or done
+        if state.get("cancel") or i >= total:
+            out_df = pd.DataFrame(state.get("rows", []))
+            state["running"] = False
+            st.session_state["scan_state"] = state
+            if not out_df.empty:
+                out_df["C2_sort"] = pd.to_datetime(out_df["C2"], errors="coerce")
+                out_df = out_df.sort_values(by=["C2_sort","Grupa","Ticker"], ascending=[False,True,True]).drop(columns=["C2_sort"])
+                st.dataframe(out_df, use_container_width=True, height=560)
+                st.download_button("📥 Pobierz wyniki (CSV)", data=out_df.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"crt_scan_{dt.date.today().isoformat()}.csv", mime="text/csv")
+                log_msg("Zakończono skanowanie." if not state.get("cancel") else "Skanowanie przerwane.")
             else:
-                setups = crt_scan(
-                    df=df,
-                    lookback_bars=(3 if params["opportunity_mode"] else params["lookback_bars"]),
-                    require_midline=params["require_midline"],
-                    strict_vs_c1open=params["strict_vs_c1open"],
-                    confirm_within=(params["confirm_within"] if params["confirm_on"] else 0),
-                    confirm_method=(params["confirm_method"] if params["confirm_on"] else "high"),
-                    directions=params["directions"],
-                )
-                htf_df = htf_map.get(yt, pd.DataFrame()) if params["key_on"] else pd.DataFrame()
-                last_two = pd.Index(df.index[-2:])
-                kept = 0
-                for rec in setups:
-                    c1_ts = pd.to_datetime(rec["C1_date"]); c2_ts = pd.to_datetime(rec["C2_date"])
-                    if params["opportunity_mode"] and ((c2_ts not in last_two) or rec.get("c3_happened", False)):
-                        continue
-                    C1L, C1H = rec["C1_low"], rec["C1_high"]
-                    C2L, C2H, C2C = rec["C2_low"], rec["C2_high"], rec["C2_close"]
-                    rng = (C1H - C1L) if pd.notna(C1H) and pd.notna(C1L) else np.nan
-                    key_tf_str, key_level_val, key_date, confluence = ("-", float("nan"), pd.NaT, False)
-                    if params["key_on"] and not htf_df.empty:
-                        key_tf_str, key_level_val, key_date, confluence = get_key_level_and_confluence(
-                            htf_df, c2_ts, rec["direction"], C1L, C1H, C2L, C2H,
-                            params["key_window_months"], params["key_interact"], params["key_rule_label"], params["key_tf"]
-                        )
-                    if rec["direction"] == "BULL":
-                        trigger = C1H; stop = C2L
-                        tp1 = C1H + 0.5*rng if pd.notna(rng) else np.nan
-                        tp2 = C1H + 1.0*rng if pd.notna(rng) else np.nan
-                        risk = trigger - stop if pd.notna(trigger) and pd.notna(stop) else np.nan
-                        r_tp1 = (tp1 - trigger)/risk if pd.notna(risk) and risk>0 and pd.notna(tp1) else np.nan
-                        r_tp2 = (tp2 - trigger)/risk if pd.notna(risk) and risk>0 and pd.notna(tp2) else np.nan
-                    else:
-                        trigger = C1L; stop = C2H
-                        tp1 = C1L - 0.5*rng if pd.notna(rng) else np.nan
-                        tp2 = C1L - 1.0*rng if pd.notna(rng) else np.nan
-                        risk = stop - trigger if pd.notna(trigger) and pd.notna(stop) else np.nan
-                        r_tp1 = (trigger - tp1)/risk if pd.notna(risk) and risk>0 and pd.notna(tp1) else np.nan
-                        r_tp2 = (trigger - tp2)/risk if pd.notna(risk) and risk>0 and pd.notna(tp2) else np.nan
-                    if params["key_on"] and params["key_require"] if "key_require" in params else False:
-                        if not confluence:
-                            pass  # skip
-                    row = {
-                        "Ticker": yt, "Spółka": meta_map.get(yt,{}).get("company", yt.replace(".WA","")),
-                        "Grupa": meta_map.get(yt,{}).get("group",""),
-                        "Kierunek": rec["direction"],
-                        "C1": c1_ts.date() if pd.notna(c1_ts) else pd.NaT,
-                        "C2": c2_ts.date() if pd.notna(c2_ts) else pd.NaT,
-                        "C3_any": (pd.to_datetime(rec.get("C3_date_any")).date() if pd.notna(rec.get("C3_date_any")) else pd.NaT),
-                        "Potwierdzenie_w_N": "TAK" if rec.get("confirmed", False) else "NIE",
-                        "C3_happened": "TAK" if rec.get("c3_happened", False) else "NIE",
-                        "Zasada potwierdzenia": rec["confirm_rule"],
-                        "C1L": round(C1L,2), "C1H": round(C1H,2),
-                        "Mid(50%)": round(rec["C1_mid"],2), "C1O": round(rec["C1_open"],2),
-                        "C2L": round(C2L,2), "C2H": round(C2H,2), "C2C": round(C2C,2),
-                        "C2 pos w C1%": round(100*rec["C2_position_in_range"],1) if pd.notna(rec["C2_position_in_range"]) else np.nan,
-                        "Sweep": rec["swept_side"],
-                        "Trigger": round(trigger,2) if pd.notna(trigger) else np.nan,
-                        "Stop": round(stop,2) if pd.notna(stop) else np.nan,
-                        "TP1": round(tp1,2) if pd.notna(tp1) else np.nan,
-                        "TP2": round(tp2,2) if pd.notna(tp2) else np.nan,
-                        "R:TP1": round(r_tp1,2) if pd.notna(r_tp1) else np.nan,
-                        "R:TP2": round(r_tp2,2) if pd.notna(r_tp2) else np.nan,
-                        "KeyTF": key_tf_str,
-                        "KeyLevel": round(key_level_val,2) if pd.notna(key_level_val) else np.nan,
-                        "KeyDate": (pd.to_datetime(key_date).date() if pd.notna(key_date) else pd.NaT),
-                        "Confluence": "TAK" if confluence else ("-" if not params["key_on"] else "NIE"),
-                    }
-                    # Filter by confluence if required
-                    if params.get("key_on") and params.get("key_require") and not confluence:
-                        pass
-                    else:
-                        state["rows"].append(row); kept += 1
-                log_msg(f"OK: {yt} – setupów: {len(setups)}, zachowano: {kept}.")
-        except Exception as e:
-            log_msg(f"Błąd: {yt} – {e}")
-        # Advance and rerun
-        state["idx"] = i + 1
-        st.session_state["scan_state"] = state
-        st.rerun()
+                st.info("Brak wyników dla bieżących ustawień.")
+                log_msg("Zakończono skanowanie: brak wyników." if not state.get("cancel") else "Skanowanie przerwane: brak wyników.")
+            # Cache for chart section
+            st.session_state["scan_out_df"] = out_df
+        else:
+            # Process one ticker per run
+            yt = state["tickers"][i]
+            params = state["params"]; data_map = state["data_map"]; htf_map = state["htf_map"]
+            progress.progress(i/max(1,total), text=f"Skanowanie: {yt} ({i+1}/{total})")
+            log_msg(f"Skanuję: {yt}…")
+            try:
+                df = data_map.get(yt)
+                if df is None or df.empty or len(df) < 5:
+                    log_msg(f"Pominięto (brak danych): {yt}")
+                else:
+                    setups = crt_scan(
+                        df=df,
+                        lookback_bars=(3 if params["opportunity_mode"] else params["lookback_bars"]),
+                        require_midline=params["require_midline"],
+                        strict_vs_c1open=params["strict_vs_c1open"],
+                        confirm_within=(params["confirm_within"] if params["confirm_on"] else 0),
+                        confirm_method=(params["confirm_method"] if params["confirm_on"] else "high"),
+                        directions=params["directions"],
+                    )
+                    htf_df = htf_map.get(yt, pd.DataFrame()) if params["key_on"] else pd.DataFrame()
+                    last_two = pd.Index(df.index[-2:])
+                    kept = 0
+                    for rec in setups:
+                        c1_ts = pd.to_datetime(rec["C1_date"]); c2_ts = pd.to_datetime(rec["C2_date"])
+                        if params["opportunity_mode"] and ((c2_ts not in last_two) or rec.get("c3_happened", False)):
+                            continue
+                        C1L, C1H = rec["C1_low"], rec["C1_high"]
+                        C2L, C2H, C2C = rec["C2_low"], rec["C2_high"], rec["C2_close"]
+                        rng = (C1H - C1L) if pd.notna(C1H) and pd.notna(C1L) else np.nan
+                        key_tf_str, key_level_val, key_date, confluence = ("-", float("nan"), pd.NaT, False)
+                        if params["key_on"] and not htf_df.empty:
+                            key_tf_str, key_level_val, key_date, confluence = get_key_level_and_confluence(
+                                htf_df, c2_ts, rec["direction"], C1L, C1H, C2L, C2H,
+                                params["key_window_months"], params["key_interact"], params["key_rule_label"], params["key_tf"]
+                            )
+                        if rec["direction"] == "BULL":
+                            trigger = C1H; stop = C2L
+                            tp1 = C1H + 0.5*rng if pd.notna(rng) else np.nan
+                            tp2 = C1H + 1.0*rng if pd.notna(rng) else np.nan
+                            risk = trigger - stop if pd.notna(trigger) and pd.notna(stop) else np.nan
+                            r_tp1 = (tp1 - trigger)/risk if pd.notna(risk) and risk>0 and pd.notna(tp1) else np.nan
+                            r_tp2 = (tp2 - trigger)/risk if pd.notna(risk) and risk>0 and pd.notna(tp2) else np.nan
+                        else:
+                            trigger = C1L; stop = C2H
+                            tp1 = C1L - 0.5*rng if pd.notna(rng) else np.nan
+                            tp2 = C1L - 1.0*rng if pd.notna(rng) else np.nan
+                            risk = stop - trigger if pd.notna(trigger) and pd.notna(stop) else np.nan
+                            r_tp1 = (trigger - tp1)/risk if pd.notna(risk) and risk>0 and pd.notna(tp1) else np.nan
+                            r_tp2 = (trigger - tp2)/risk if pd.notna(risk) and risk>0 and pd.notna(tp2) else np.nan
+                        if params["key_on"] and params["key_require"] if "key_require" in params else False:
+                            if not confluence:
+                                pass  # skip
+                        row = {
+                            "Ticker": yt, "Spółka": meta_map.get(yt,{}).get("company", yt.replace(".WA","")),
+                            "Grupa": meta_map.get(yt,{}).get("group",""),
+                            "Kierunek": rec["direction"],
+                            "C1": c1_ts.date() if pd.notna(c1_ts) else pd.NaT,
+                            "C2": c2_ts.date() if pd.notna(c2_ts) else pd.NaT,
+                            "C3_any": (pd.to_datetime(rec.get("C3_date_any")).date() if pd.notna(rec.get("C3_date_any")) else pd.NaT),
+                            "Potwierdzenie_w_N": "TAK" if rec.get("confirmed", False) else "NIE",
+                            "C3_happened": "TAK" if rec.get("c3_happened", False) else "NIE",
+                            "Zasada potwierdzenia": rec["confirm_rule"],
+                            "C1L": round(C1L,2), "C1H": round(C1H,2),
+                            "Mid(50%)": round(rec["C1_mid"],2), "C1O": round(rec["C1_open"],2),
+                            "C2L": round(C2L,2), "C2H": round(C2H,2), "C2C": round(C2C,2),
+                            "C2 pos w C1%": round(100*rec["C2_position_in_range"],1) if pd.notna(rec["C2_position_in_range"]) else np.nan,
+                            "Sweep": rec["swept_side"],
+                            "Trigger": round(trigger,2) if pd.notna(trigger) else np.nan,
+                            "Stop": round(stop,2) if pd.notna(stop) else np.nan,
+                            "TP1": round(tp1,2) if pd.notna(tp1) else np.nan,
+                            "TP2": round(tp2,2) if pd.notna(tp2) else np.nan,
+                            "R:TP1": round(r_tp1,2) if pd.notna(r_tp1) else np.nan,
+                            "R:TP2": round(r_tp2,2) if pd.notna(r_tp2) else np.nan,
+                            "KeyTF": key_tf_str,
+                            "KeyLevel": round(key_level_val,2) if pd.notna(key_level_val) else np.nan,
+                            "KeyDate": (pd.to_datetime(key_date).date() if pd.notna(key_date) else pd.NaT),
+                            "Confluence": "TAK" if confluence else ("-" if not params["key_on"] else "NIE"),
+                        }
+                        # Filter by confluence if required
+                        if params.get("key_on") and params.get("key_require") and not confluence:
+                            pass
+                        else:
+                            state["rows"].append(row); kept += 1
+                    log_msg(f"OK: {yt} – setupów: {len(setups)}, zachowano: {kept}.")
+            except Exception as e:
+                log_msg(f"Błąd: {yt} – {e}")
+            # Advance and rerun
+            state["idx"] = i + 1
+            st.session_state["scan_state"] = state
+            st.rerun()
 
 # Provide out_df to chart section
 out_df = st.session_state.get("scan_out_df", pd.DataFrame())
@@ -297,6 +369,7 @@ with col_chart_btn:
         st.session_state["show_chart"] = not st.session_state["show_chart"]; st.rerun()
 
 if st.session_state.get("show_chart", False):
+    st.markdown('<div id="chart-anchor"></div>', unsafe_allow_html=True)
     st.subheader("📊 Wykres (W1, z poziomami)")
     if not out_df.empty:
         valid_mask = out_df["Kierunek"].isin(["BULL","BEAR"])
@@ -306,10 +379,25 @@ if st.session_state.get("show_chart", False):
     if not tickers_for_chart:
         st.info("Brak tickerów do wyświetlenia na wykresie.")
     else:
-        sel = st.selectbox("Wybierz ticker do wykresu (W1)", options=tickers_for_chart, key="chart_ticker")
+        def _on_chart_select_change() -> None:
+            st.session_state["scroll_to_chart_anchor"] = True
+
+        sel = st.selectbox(
+            "Wybierz ticker do wykresu (W1)",
+            options=tickers_for_chart,
+            key="chart_ticker",
+            on_change=_on_chart_select_change,
+        )
         rec = out_df[out_df["Ticker"] == sel].sort_values(by="C2", ascending=False).iloc[0].to_dict()
-        weekly = load_weekly_ohlcv(sel, period="max")
+        chart_sources = normalize_source_priority(st.session_state.get("scan_state", {}).get("params", {}).get("data_sources", current_source_priority))
+        weekly = load_weekly_ohlcv(sel, period="max", source_priority=chart_sources)
         if weekly is None or weekly.empty:
             st.info("Brak danych tygodniowych do rysowania wykresu.")
         else:
             st.plotly_chart(build_plotly_chart(weekly, rec, sel), use_container_width=True)
+
+    if st.session_state.pop("scroll_to_chart_anchor", False):
+        components.html(
+            "<script>const anchor=window.parent.document.getElementById('chart-anchor'); if(anchor){anchor.scrollIntoView({behavior:'instant', block:'start'});}</script>",
+            height=0,
+        )
