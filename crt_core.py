@@ -50,68 +50,107 @@ def crt_scan(
     skip_dual_sweep: bool = True,
 ) -> List[Dict]:
     out: List[Dict] = []
-    if df is None or df.empty or len(df) < 5: return out
+    if df is None or df.empty: return out
     d = df.dropna(subset=["Open","High","Low","Close"]).copy()
-    if len(d) < 5: return out
+    min_required = max(2, int(c1_window_bars) + 1)
+    if len(d) < min_required:
+        return out
     n = len(d); start_idx = max(1, n - lookback_bars)
     confirm_method = _norm_method(confirm_method)
     for i in range(start_idx, n):
-        C1, C2 = d.iloc[i-1], d.iloc[i]
-        # previous single bar or multi-bar window [i-c1_window_bars, i)
-        if c1_window_bars <= 1:
-            C1L, C1H = float(C1["Low"]), float(C1["High"])
-        else:
-            start_win = max(0, i - c1_window_bars)
-            win = d.iloc[start_win:i]
-            if win.empty:
-                continue
-            C1L, C1H = float(win["Low"].min()), float(win["High"].max())
-        C2L, C2H, C2C, C1O = float(C2["Low"]), float(C2["High"]), float(C2["Close"]), float(C1["Open"])
-        C1_mid = midline(C1L, C1H)
-        close_in = _ge(C2C, C1L) and _le(C2C, C1H)  # eps-aware
-        def _record(direction: str, swept_side: str):
-            dir_tag = "BULL" if direction=="bullish" else "BEAR"
-            c3_within_idx, c3_any_idx = _find_c3(d, i, C1L, C1H, confirm_method, dir_tag)
-            confirmed_within = False
-            if confirm_within and (i+1) < n:
-                end_j = min(n-1, i+confirm_within)
-                for j in range(i+1, end_j+1):
-                    H = float(d.iloc[j]['High']); L = float(d.iloc[j]['Low']); C = float(d.iloc[j]['Close'])
-                    if dir_tag == "BULL":
-                        cond = (H > C1H) if confirm_method == "high" else (C > C1H)
-                    else:
-                        cond = (L < C1L) if confirm_method == "high" else (C < C1L)
-                    if cond: confirmed_within=True; c3_within_idx=j; break
-            # clearer, direction-aware confirm rule text (match tests: lowercase 'close'/'high'/'low')
-            if confirm_within:
-                if confirm_method == "high":
-                    rule = "high>C1H" if dir_tag=="BULL" else "low<C1L"
-                else:
-                    rule = "close>C1H" if dir_tag=="BULL" else "close<C1L"
-                confirm_rule = f"{rule} in {confirm_within}"
+        if i - 1 < 0:
+            continue
+        C2 = d.iloc[i]
+        made_record = False
+        max_back = max(1, int(c1_window_bars))
+        max_candidates = max_back + 1
+        lower_bound = max(0, i - max_candidates)
+        for base_idx in range(i - 1, lower_bound - 1, -1):
+            C1 = d.iloc[base_idx]
+            if c1_window_bars <= 1:
+                C1L, C1H = float(C1["Low"]), float(C1["High"])
             else:
-                confirm_rule = "no confirm"
-            out.append({
-                "direction": dir_tag, "C1_date": d.index[i-1], "C2_date": d.index[i],
-                "C3_date_within": d.index[c3_within_idx] if c3_within_idx is not None else pd.NaT,
-                "C3_date_any": d.index[c3_any_idx] if c3_any_idx is not None else pd.NaT,
-                "confirmed": bool(confirmed_within), "c3_happened": bool(c3_any_idx is not None),
-                "confirm_rule": confirm_rule,
-                "C1_low": C1L, "C1_high": C1H, "C1_mid": C1_mid, "C1_open": C1O,
-                "C2_low": C2L, "C2_high": C2H, "C2_close": C2C,
-                "C2_position_in_range": (C2C - C1L) / (C1H - C1L) if (C1H > C1L) else np.nan,
-                "swept_side": swept_side
-            })
-        if "bullish" in directions:
-            cond = (C2L < C1L) and close_in
-            if require_midline: cond &= (C2C >= C1_mid)
-            if strict_vs_c1open: cond &= (C2C >= C1O)
-            if cond: _record("bullish","LOW")
-        if "bearish" in directions:
-            cond = (C2H > C1H) and close_in
-            if require_midline: cond &= (C2C <= C1_mid)
-            if strict_vs_c1open: cond &= (C2C <= C1O)
-            if cond: _record("bearish","HIGH")
+                start_win = max(0, base_idx - (c1_window_bars - 1))
+                win = d.iloc[start_win:base_idx+1]
+                if win.empty or len(win) < c1_window_bars:
+                    continue
+                C1L, C1H = float(win["Low"].min()), float(win["High"].max())
+            C2L, C2H, C2C = float(C2["Low"]), float(C2["High"]), float(C2["Close"])
+            C1O = float(C1["Open"])
+            C1_mid = midline(C1L, C1H)
+            close_in = _ge(C2C, C1L) and _le(C2C, C1H)
+            sweep_low = _lt(C2L, C1L)
+            sweep_high = _gt(C2H, C1H)
+            if not close_in:
+                break
+            if skip_dual_sweep and sweep_low and sweep_high:
+                if _gt(C1H, C1L):
+                    break
+
+            def _record(direction: str, swept_side: str):
+                dir_tag = "BULL" if direction == "bullish" else "BEAR"
+                c3_within_idx, c3_any_idx = _find_c3(d, i, C1L, C1H, confirm_method, dir_tag)
+                confirmed_within = False
+                if confirm_within and (i + 1) < n:
+                    end_j = min(n - 1, i + confirm_within)
+                    for j in range(i + 1, end_j + 1):
+                        H = float(d.iloc[j]["High"]); L = float(d.iloc[j]["Low"]); C_val = float(d.iloc[j]["Close"])
+                        if dir_tag == "BULL":
+                            cond = (H > C1H) if confirm_method == "high" else (C_val > C1H)
+                        else:
+                            cond = (L < C1L) if confirm_method == "high" else (C_val < C1L)
+                        if cond:
+                            confirmed_within = True
+                            c3_within_idx = j
+                            break
+                if confirm_within:
+                    if confirm_method == "high":
+                        rule = "high>C1H" if dir_tag == "BULL" else "low<C1L"
+                    else:
+                        rule = "close>C1H" if dir_tag == "BULL" else "close<C1L"
+                    confirm_rule = f"{rule} in {confirm_within}"
+                else:
+                    confirm_rule = "no confirm"
+                out.append({
+                    "direction": dir_tag,
+                    "C1_date": d.index[base_idx],
+                    "C2_date": d.index[i],
+                    "C3_date_within": d.index[c3_within_idx] if c3_within_idx is not None else pd.NaT,
+                    "C3_date_any": d.index[c3_any_idx] if c3_any_idx is not None else pd.NaT,
+                    "confirmed": bool(confirmed_within),
+                    "c3_happened": bool(c3_any_idx is not None),
+                    "confirm_rule": confirm_rule,
+                    "C1_low": C1L,
+                    "C1_high": C1H,
+                    "C1_mid": C1_mid,
+                    "C1_open": C1O,
+                    "C2_low": C2L,
+                    "C2_high": C2H,
+                    "C2_close": C2C,
+                    "C2_position_in_range": (C2C - C1L) / (C1H - C1L) if (C1H > C1L) else np.nan,
+                    "swept_side": swept_side,
+                })
+
+            if "bullish" in directions:
+                cond = sweep_low
+                if require_midline:
+                    cond &= _ge(C2C, C1_mid)
+                if strict_vs_c1open:
+                    cond &= _ge(C2C, C1O)
+                if cond:
+                    _record("bullish", "LOW")
+                    made_record = True
+            if "bearish" in directions:
+                cond = sweep_high
+                if require_midline:
+                    cond &= _le(C2C, C1_mid)
+                if strict_vs_c1open:
+                    cond &= _le(C2C, C1O)
+                if cond:
+                    _record("bearish", "HIGH")
+                    made_record = True
+            if made_record:
+                break
     out.sort(key=lambda r: (pd.Timestamp(r["C2_date"]) if pd.notna(r["C2_date"]) else pd.Timestamp(0)), reverse=True)
     return out
 
