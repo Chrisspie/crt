@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import numpy as np, pandas as pd
+import math
 
 def midline(low: float, high: float) -> float:
     return (float(low) + float(high)) / 2.0
@@ -42,13 +43,15 @@ def crt_scan(df: pd.DataFrame, lookback_bars: int = 30, require_midline: bool = 
                     else:
                         cond = (L < C1L) if confirm_method == "high" else (C < C1L)
                     if cond: confirmed_within=True; c3_within_idx=j; break
-            confirm_rule = "no confirm"
+            # clearer, direction-aware confirm rule text (match tests: lowercase 'close'/'high'/'low')
             if confirm_within:
                 if confirm_method == "high":
                     rule = "high>C1H" if dir_tag=="BULL" else "low<C1L"
                 else:
                     rule = "close>C1H" if dir_tag=="BULL" else "close<C1L"
                 confirm_rule = f"{rule} in {confirm_within}"
+            else:
+                confirm_rule = "no confirm"
             out.append({
                 "direction": dir_tag, "C1_date": d.index[i-1], "C2_date": d.index[i],
                 "C3_date_within": d.index[c3_within_idx] if c3_within_idx is not None else pd.NaT,
@@ -73,23 +76,91 @@ def crt_scan(df: pd.DataFrame, lookback_bars: int = 30, require_midline: bool = 
     out.sort(key=lambda r: (pd.Timestamp(r["C2_date"]) if pd.notna(r["C2_date"]) else pd.Timestamp(0)), reverse=True)
     return out
 
-def get_key_level_and_confluence(htf_df: pd.DataFrame, c2_ts: pd.Timestamp, direction: str,
-    c1_low: float, c1_high: float, c2_low: float, c2_high: float, key_window_months: int,
-    key_interact: str, key_strict: str, htf_interval: str):
-    if htf_df is None or htf_df.empty or c2_ts is None or pd.isna(c2_ts): return "-", float("nan"), pd.NaT, False
-    bars_per = 1 if htf_interval=="1mo" else 3
-    import math
-    n_bars = max(1, math.ceil(key_window_months / bars_per))
+# --- crt_core.py ---
+def get_key_level_and_confluence(
+    htf_df: pd.DataFrame,
+    c2_ts: pd.Timestamp,
+    direction: str,
+    c1_low: float, c1_high: float,
+    c2_low: float, c2_high: float,
+    key_window_months: int,
+    key_interact: str,
+    key_rule_label: str,
+    htf_interval: str
+):
+    """
+    HTF confluence:
+      - Kandydaci (per świeca HTF):
+          BULL: Low, Close, Open
+          BEAR: High, Close, Open
+      - v (punkt kontaktu):
+          'Tylko C1'      -> C1L / C1H
+          'Tylko C2'      -> C2L / C2H
+          'C1 lub C2'     -> wybierz (C1 vs C2), który daje mniejszy znormalizowany dystans do poziomu HTF
+      - Tolerancja:
+          touch  -> 1.5% * |key|
+          strict -> 0.5%  * |key|  + warunek kierunkowy (BULL: v <= key, BEAR: v >= key)
+    """
+    tf_str = "1M" if htf_interval == "1mo" else "3M"
+
+    if htf_df is None or htf_df.empty or c2_ts is None or pd.isna(c2_ts):
+        return tf_str, float("nan"), pd.NaT, False
+
+    bars_per = 1 if htf_interval == "1mo" else 3
+    n_bars = max(1, math.ceil(float(key_window_months) / float(bars_per)))
+
     htf_hist = htf_df[htf_df.index <= c2_ts]
-    if htf_hist.empty: return "-", float("nan"), pd.NaT, False
+    if htf_hist.empty:
+        return tf_str, float("nan"), pd.NaT, False
+
     win = htf_hist.tail(n_bars)
-    if direction == "BULL":
-        key_level_val = float(win["Low"].min()); key_date = win["Low"].idxmin()
-        value = float(c1_low) if key_interact=="Tylko C1" else (float(c2_low) if key_interact=="Tylko C2" else min(float(c1_low), float(c2_low)))
-        confluence = (value < key_level_val) if key_strict.startswith("strict") else (value <= key_level_val)
-        return ("1M" if htf_interval=="1mo" else "3M"), key_level_val, key_date, confluence
-    else:
-        key_level_val = float(win["High"].max()); key_date = win["High"].idxmax()
-        value = float(c1_high) if key_interact=="Tylko C1" else (float(c2_high) if key_interact=="Tylko C2" else max(float(c1_high), float(c2_high)))
-        confluence = (value > key_level_val) if key_strict.startswith("strict") else (value >= key_level_val)
-        return ("1M" if htf_interval=="1mo" else "3M"), key_level_val, key_date, confluence
+
+    # Zbuduj listę kandydatów poziomów z okna HTF
+    cands = []
+    for idx_, row in win.iterrows():
+        if direction == "BULL":
+            cands.extend([(float(row["Low"]), idx_), (float(row["Close"]), idx_), (float(row["Open"]), idx_)])
+        else:
+            cands.extend([(float(row["High"]), idx_), (float(row["Close"]), idx_), (float(row["Open"]), idx_)])
+
+    # Zbiór możliwych 'v' zależnie od ustawienia
+    v_candidates = []
+    if key_interact == "Tylko C1":
+        v_candidates.append(float(c1_low) if direction == "BULL" else float(c1_high))
+    elif key_interact == "Tylko C2":
+        v_candidates.append(float(c2_low) if direction == "BULL" else float(c2_high))
+    else:  # "C1 lub C2" -> sprawdzimy obie, wybierzemy lepszą
+        v_candidates.append(float(c1_low) if direction == "BULL" else float(c1_high))
+        v_candidates.append(float(c2_low) if direction == "BULL" else float(c2_high))
+
+    best = None  # (dist_norm, key_val, key_date, v_used)
+    for v in v_candidates:
+        # dobierz najbliższy poziom HTF do TEGO v
+        best_val, best_date, best_dist = float("nan"), pd.NaT, float("inf")
+        for val, dt_ in cands:
+            if pd.isna(val):
+                continue
+            dist = abs(v - val)
+            if dist < best_dist:
+                best_val, best_date, best_dist = val, dt_, dist
+        if pd.isna(best_val):
+            continue
+        denom = max(1.0, abs(best_val))
+        dist_norm = best_dist / denom
+        if (best is None) or (dist_norm < best[0]):
+            best = (dist_norm, float(best_val), best_date, v)
+
+    if best is None:
+        return tf_str, float("nan"), pd.NaT, False
+
+    dist_norm, key_val, key_date, v_used = best
+    is_strict = str(key_rule_label).lower().startswith("strict")
+
+    tol_pct = 0.005 if is_strict else 0.015  # 0.5% vs 1.5%
+    dist_ok = dist_norm <= tol_pct
+
+    directional_ok = True
+    if is_strict:
+        directional_ok = (v_used <= key_val) if direction == "BULL" else (v_used >= key_val)
+
+    return tf_str, key_val, key_date, bool(dist_ok and directional_ok)
