@@ -23,5 +23,6 @@ def test_key_level_touch_bull():
                       "High":np.linspace(11,12,len(idx)),
                       "Low":np.linspace(9,8,len(idx)),
                       "Close":np.linspace(10,9.5,len(idx))}, index=idx)
-    tf, kl, kd, conf = get_key_level_and_confluence(htf, pd.to_datetime("2023-12-29"), "BULL", 9.2, 10.0, 9.0, 9.9, 6, "C1 lub C2", "touch (≤, ≥)", "1mo")
+    tf, kl, kd, conf = get_key_level_and_confluence(htf, pd.to_datetime("2023-12-29"), "BULL",
+        9.2, 10.0, 9.0, 9.9, 6, "C1 lub C2", "touch (≤, ≥)", "1mo")
     assert tf in ("1M","3M") and isinstance(kl, float)

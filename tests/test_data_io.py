@@ -13,7 +13,6 @@ def test_load_many_weekly_ohlcv_multi(monkeypatch):
     assert set(out.keys()) >= {"AAA","BBB"}
 
 def test_stringio_read_html(monkeypatch):
-    # ensure we pass something through without raising
     import requests
     html = "<table><tr><th>Symbol</th><th>Name</th></tr><tr><td>AAA</td><td>Alpha</td></tr></table>"
     def fake_get(url, headers=None, timeout=20):

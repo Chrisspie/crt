@@ -8,7 +8,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 YF_THREADS = True
 
 WIG20_HC_TICKERS = ["PKN","KGH","PKO","PEO","PZU","PGE","CDR","ALE","DNP","LPP","OPL","CPS","ALR","ING","MBK","TPE","JSW","CCC","KTY"]
-MWIG40_HC_TICKERS = ["XTB","PLW","TEN","KRU","GPW","BDX","BHW","LWB","AMC","ASB","11B","CIG","AFR","MLG","STP","PKP","MAB","NEU","OPN","VRG","WPL","WRT","DOM","MRC","PHN","PEK","IPF","TIM","MFO","PBX","BRS","FTE","BUD","APS","DVR","TOR","CIGAMES","LIVE","AMX","DIN"]
+MWIG40_HC_TICKERS = ["XTB","PLW","TEN","KRU","GPW","BDX","BHW","LWB","AMC","ASB","11B","CIG","MLG","STP","PKP","MAB","NEU","OPN","VRG","WPL","DOM","MRC","PHN","TIM","MFO","PBX","BRS","FTE","TOR","LVC","DNP"]
 SP500_FALLBACK = ["AAPL","MSFT","NVDA","GOOGL","GOOG","AMZN","META","BRK-B","AVGO","TSLA","UNH","LLY","XOM","JPM","V","JNJ","PG","MA","HD","COST","MRK","ABBV","PEP","KO","TMO","BAC","WMT","ADBE","NFLX","CRM","CSCO","INTC","QCOM","NKE","LIN","ACN","MCD","ORCL","TXN","AMD"]
 
 @st.cache_data(ttl=60*60*24, show_spinner=False)
@@ -81,9 +81,14 @@ def fetch_sp500_companies() -> pd.DataFrame:
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_weekly_ohlcv(yahoo_ticker: str, period: str = "5y") -> pd.DataFrame:
-    df = yf.download(yahoo_ticker, interval="1wk", period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
-    if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
-    if not df.empty: df=df.dropna(subset=["Open","High","Low","Close"])
+    try:
+        df = yf.download(yahoo_ticker, interval="1wk", period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
+    except Exception:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if not df.empty:
+        df = df.dropna(subset=["Open","High","Low","Close"])
     return df
 
 def _extract_single(df: pd.DataFrame) -> pd.DataFrame:
@@ -131,9 +136,14 @@ def load_many_weekly_ohlcv(tickers: list[str], *, period: str = "5y", start: str
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
 def load_htf_ohlcv(yahoo_ticker: str, interval: str = "1mo", period: str = "max") -> pd.DataFrame:
-    df = yf.download(yahoo_ticker, interval=interval, period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
-    if isinstance(df.columns, pd.MultiIndex): df.columns=df.columns.get_level_values(0)
-    if not df.empty: df=df.dropna(subset=["Open","High","Low","Close"])
+    try:
+        df = yf.download(yahoo_ticker, interval=interval, period=period, auto_adjust=False, progress=False, threads=YF_THREADS)
+    except Exception:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if not df.empty:
+        df = df.dropna(subset=["Open","High","Low","Close"])
     return df
 
 @st.cache_data(ttl=60*60*12, show_spinner=False)
