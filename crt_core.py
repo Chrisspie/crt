@@ -7,29 +7,68 @@ import math
 def midline(low: float, high: float) -> float:
     return (float(low) + float(high)) / 2.0
 
+EPS: float = 1e-9
+
+def _norm_method(method: str) -> str:
+    m = str(method).strip().lower()
+    return m if m in ("high", "close") else "high"
+
+def _gt(a: float, b: float) -> bool:  # strict >
+    return (a - b) > EPS
+
+def _lt(a: float, b: float) -> bool:  # strict <
+    return (b - a) > EPS
+
+def _ge(a: float, b: float) -> bool:  # >= with eps
+    return (a - b) >= -EPS
+
+def _le(a: float, b: float) -> bool:  # <= with eps
+    return (b - a) >= -EPS
+
 def _find_c3(d: pd.DataFrame, i_c2: int, c1_low: float, c1_high: float, method: str, dir_tag: str) -> Tuple[Optional[int], Optional[int]]:
     n = len(d); c3_any_idx: Optional[int] = None
+    method = _norm_method(method)
     for j in range(i_c2 + 1, n):
         H = float(d.iloc[j]["High"]); L = float(d.iloc[j]["Low"]); C = float(d.iloc[j]["Close"])
         if dir_tag == "BULL":
-            cond_any = (H > c1_high) if method == "high" else (C > c1_high)
+            cond_any = (_gt(H, c1_high)) if method == "high" else (_gt(C, c1_high))
         else:
-            cond_any = (L < c1_low) if method == "high" else (C < c1_low)
+            cond_any = (_lt(L, c1_low)) if method == "high" else (_lt(C, c1_low))
         if cond_any: c3_any_idx = j; break
     return None, c3_any_idx
 
-def crt_scan(df: pd.DataFrame, lookback_bars: int = 30, require_midline: bool = False, strict_vs_c1open: bool = False,
-             confirm_within: int = 0, confirm_method: str = "high", directions: Tuple[str, ...] = ("bullish","bearish")) -> List[Dict]:
+def crt_scan(
+    df: pd.DataFrame,
+    lookback_bars: int = 30,
+    require_midline: bool = False,
+    strict_vs_c1open: bool = False,
+    confirm_within: int = 0,
+    confirm_method: str = "high",
+    directions: Tuple[str, ...] = ("bullish","bearish"),
+    *,
+    c1_window_bars: int = 1,
+    skip_dual_sweep: bool = True,
+) -> List[Dict]:
     out: List[Dict] = []
     if df is None or df.empty or len(df) < 5: return out
     d = df.dropna(subset=["Open","High","Low","Close"]).copy()
     if len(d) < 5: return out
     n = len(d); start_idx = max(1, n - lookback_bars)
+    confirm_method = _norm_method(confirm_method)
     for i in range(start_idx, n):
         C1, C2 = d.iloc[i-1], d.iloc[i]
-        C1L, C1H = float(C1["Low"]), float(C1["High"])
+        # previous single bar or multi-bar window [i-c1_window_bars, i)
+        if c1_window_bars <= 1:
+            C1L, C1H = float(C1["Low"]), float(C1["High"])
+        else:
+            start_win = max(0, i - c1_window_bars)
+            win = d.iloc[start_win:i]
+            if win.empty:
+                continue
+            C1L, C1H = float(win["Low"].min()), float(win["High"].max())
         C2L, C2H, C2C, C1O = float(C2["Low"]), float(C2["High"]), float(C2["Close"]), float(C1["Open"])
-        C1_mid = midline(C1L, C1H); close_in = (C1L <= C2C <= C1H)
+        C1_mid = midline(C1L, C1H)
+        close_in = _ge(C2C, C1L) and _le(C2C, C1H)  # eps-aware
         def _record(direction: str, swept_side: str):
             dir_tag = "BULL" if direction=="bullish" else "BEAR"
             c3_within_idx, c3_any_idx = _find_c3(d, i, C1L, C1H, confirm_method, dir_tag)
@@ -161,6 +200,6 @@ def get_key_level_and_confluence(
 
     directional_ok = True
     if is_strict:
-        directional_ok = (v_used <= key_val) if direction == "BULL" else (v_used >= key_val)
+        directional_ok = (v_used <= key_val + EPS) if direction == "BULL" else (v_used + EPS >= key_val)
 
     return tf_str, key_val, key_date, bool(dist_ok and directional_ok)

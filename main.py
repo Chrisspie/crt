@@ -132,29 +132,31 @@ if universe_df.empty:
 active_series = universe_df["yahoo_ticker"].map(st.session_state["active_map"])
 universe_df["Active"] = active_series.where(active_series.notna(), True).astype(bool)
 
-st.subheader("🎛️ Panel aktywnych spółek")
-colA, colB, _ = st.columns([1,1,2])
-with colA:
-    if st.button("Zaznacz wszystkie"): universe_df["Active"] = True
-with colB:
-    if st.button("Odznacz wszystkie"): universe_df["Active"] = False
+panel_caption = st.empty()
+with st.expander("🎛️ Panel aktywnych spółek", expanded=True):
+    colA, colB, _ = st.columns([1,1,2])
+    with colA:
+        if st.button("Zaznacz wszystkie"): universe_df["Active"] = True
+    with colB:
+        if st.button("Odznacz wszystkie"): universe_df["Active"] = False
 
-edited_df = st.data_editor(
-    universe_df.sort_values(["group","yahoo_ticker"]).reset_index(drop=True),
-    key="universe_editor",
-    use_container_width=True,
-    height=360,
-    column_config={
-        "company": st.column_config.TextColumn("Spółka", disabled=True),
-        "yahoo_ticker": st.column_config.TextColumn("Ticker (Yahoo)", disabled=True),
-        "group": st.column_config.TextColumn("Grupa", disabled=True),
-        "Active": st.column_config.CheckboxColumn("Aktywna"),
-    },
-)
+    edited_df = st.data_editor(
+        universe_df.sort_values(["group","yahoo_ticker"]).reset_index(drop=True),
+        key="universe_editor",
+        use_container_width=True,
+        height=360,
+        column_config={
+            "company": st.column_config.TextColumn("Spółka", disabled=True),
+            "yahoo_ticker": st.column_config.TextColumn("Ticker (Yahoo)", disabled=True),
+            "group": st.column_config.TextColumn("Grupa", disabled=True),
+            "Active": st.column_config.CheckboxColumn("Aktywna"),
+        },
+    )
+
 st.session_state["active_map"] = dict(zip(edited_df["yahoo_ticker"], edited_df["Active"]))
 active_tickers = edited_df.loc[edited_df["Active"], "yahoo_ticker"].tolist()
 meta_map = edited_df.set_index("yahoo_ticker")[["company","group","Active"]].to_dict(orient="index")
-st.caption(f"Aktywnych tickerów: **{len(active_tickers)}** / {len(edited_df)}")
+panel_caption.caption(f"Aktywnych tickerów: **{len(active_tickers)}** / {len(edited_df)}")
 
 if not active_tickers:
     st.info("Zaznacz przynajmniej jedną spółkę."); st.stop()
@@ -177,6 +179,19 @@ def log_msg(msg: str):
     if state is not None:
         state.setdefault("logs", []).append(f"[{ts}] {msg}")
         st.session_state["scan_state"] = state
+
+def render_scan_results(df: pd.DataFrame) -> None:
+    """Render scan results table with a matching download button."""
+    if df is None or df.empty:
+        st.info("Brak wyników dla bieżących ustawień.")
+        return
+    st.dataframe(df, use_container_width=True, height=560)
+    st.download_button(
+        "📥 Pobierz wyniki (CSV)",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=f"crt_scan_{dt.date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
 
 # Start button (only when not running)
 if not state or not state.get("running"):
@@ -257,12 +272,8 @@ else:
             if not out_df.empty:
                 out_df["C2_sort"] = pd.to_datetime(out_df["C2"], errors="coerce")
                 out_df = out_df.sort_values(by=["C2_sort","Grupa","Ticker"], ascending=[False,True,True]).drop(columns=["C2_sort"])
-                st.dataframe(out_df, use_container_width=True, height=560)
-                st.download_button("📥 Pobierz wyniki (CSV)", data=out_df.to_csv(index=False).encode("utf-8"),
-                                   file_name=f"crt_scan_{dt.date.today().isoformat()}.csv", mime="text/csv")
                 log_msg("Zakończono skanowanie." if not state.get("cancel") else "Skanowanie przerwane.")
             else:
-                st.info("Brak wyników dla bieżących ustawień.")
                 log_msg("Zakończono skanowanie: brak wyników." if not state.get("cancel") else "Skanowanie przerwane: brak wyników.")
             # Cache for chart section
             st.session_state["scan_out_df"] = out_df
@@ -360,6 +371,9 @@ else:
 
 # Provide out_df to chart section
 out_df = st.session_state.get("scan_out_df", pd.DataFrame())
+
+if (not state or not state.get("running")) and "scan_out_df" in st.session_state:
+    render_scan_results(out_df)
 
 st.divider()
 col_chart_btn, _ = st.columns([1,3])
