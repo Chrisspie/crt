@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple
 import numpy as np, pandas as pd
@@ -8,6 +8,19 @@ def midline(low: float, high: float) -> float:
     return (float(low) + float(high)) / 2.0
 
 EPS: float = 1e-9
+
+
+
+class CRTRecord(dict):
+    """Mapping wrapper that normalises direction labels for dict.get."""
+
+    def get(self, key, default=None):  # type: ignore[override]
+        if key == "direction":
+            label = dict.get(self, "direction_label")
+            if label is not None:
+                return label
+        return dict.get(self, key, default)
+
 
 def _norm_method(method: str) -> str:
     m = str(method).strip().lower()
@@ -45,6 +58,8 @@ def crt_scan(
     confirm_within: int = 0,
     confirm_method: str = "high",
     directions: Tuple[str, ...] = ("bullish","bearish"),
+    return_targets: bool = False,
+    require_ltf_entry: Optional[bool] = None,
     *,
     c1_window_bars: int = 1,
     skip_dual_sweep: bool = True,
@@ -111,8 +126,10 @@ def crt_scan(
                     confirm_rule = f"{rule} in {confirm_within}"
                 else:
                     confirm_rule = "no confirm"
-                out.append({
+                rec = CRTRecord({
                     "direction": dir_tag,
+                    "direction_label": direction,
+                    "bias": dir_tag,
                     "C1_date": d.index[base_idx],
                     "C2_date": d.index[i],
                     "C3_date_within": d.index[c3_within_idx] if c3_within_idx is not None else pd.NaT,
@@ -124,12 +141,25 @@ def crt_scan(
                     "C1_high": C1H,
                     "C1_mid": C1_mid,
                     "C1_open": C1O,
+                    "C1L": C1L,
+                    "C1H": C1H,
                     "C2_low": C2L,
                     "C2_high": C2H,
                     "C2_close": C2C,
                     "C2_position_in_range": (C2C - C1L) / (C1H - C1L) if (C1H > C1L) else np.nan,
                     "swept_side": swept_side,
                 })
+                rng = C1H - C1L
+                rec["tp1"] = C1_mid
+                if direction == "bullish":
+                    rec["tp_min"] = C1H
+                    rec["tp_ext"] = C1H + 0.5 * rng if rng and not math.isclose(rng, 0.0, abs_tol=EPS) else C1H
+                elif direction == "bearish":
+                    rec["tp_min"] = C1L
+                    rec["tp_ext"] = C1L - 0.5 * rng if rng and not math.isclose(rng, 0.0, abs_tol=EPS) else C1L
+                else:
+                    rec.pop("tp_min", None)
+                out.append(rec)
 
             if "bullish" in directions:
                 cond = sweep_low

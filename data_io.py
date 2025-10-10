@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 from __future__ import annotations
 import datetime as dt
 from collections import OrderedDict
@@ -8,6 +8,24 @@ from io import StringIO
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 YF_THREADS = True
+YF_INTERVAL_ALIASES = {
+    "240m": "4h",
+}
+
+YF_INTERVAL_LIMIT_DAYS = {
+    "1m": 7,
+    "2m": 60,
+    "5m": 60,
+    "15m": 60,
+    "30m": 60,
+    "60m": 730,
+    "90m": 60,
+    "1h": 730,
+    "2h": 730,
+    "4h": 730,
+    "240m": 730,
+}
+
 
 WIG20_HC_TICKERS = ["PKN","KGH","PKO","PEO","PZU","PGE","CDR","ALE","DNP","LPP","OPL","CPS","ALR","ING","MBK","TPE","JSW","CCC","KTY"]
 MWIG40_HC_TICKERS = ["XTB","PLW","TEN","KRU","GPW","BDX","BHW","LWB","AMC","ASB","11B","CIG","MLG","STP","PKP","MAB","NEU","OPN","VRG","WPL","DOM","MRC","PHN","TIM","MFO","PBX","BRS","FTE","TOR","LVC","DNP"]
@@ -19,6 +37,7 @@ STOOQ_BASE_URLS = (
 )
 
 STOOQ_INTERVAL_MAP = {
+    "1d": "d",
     "1wk": "w",
     "1mo": "m",
     "3mo": "q",
@@ -139,6 +158,60 @@ def _yahoo_to_stooq_symbol(yahoo_ticker: str) -> str | None:
     return None
 
 
+
+def _normalize_yf_interval(interval: str) -> str:
+    key = (interval or "").strip().lower()
+    return YF_INTERVAL_ALIASES.get(key, key)
+
+def _get_yf_interval_limit_days(interval: str) -> int | None:
+    key = (interval or "").strip().lower()
+    normalized = _normalize_yf_interval(key)
+    return YF_INTERVAL_LIMIT_DAYS.get(key) or YF_INTERVAL_LIMIT_DAYS.get(normalized)
+
+def _period_to_days_simple(period: str | None) -> int | None:
+    if not period or period == "max":
+        return None
+    value = period.strip().lower()
+    if value.endswith('d') and value[:-1].isdigit():
+        return int(value[:-1])
+    if value.endswith('wk') and value[:-2].isdigit():
+        return int(value[:-2]) * 7
+    if value.endswith('mo') and value[:-2].isdigit():
+        return int(value[:-2]) * 30
+    if value.endswith('y') and value[:-1].isdigit():
+        return int(value[:-1]) * 365
+    return None
+
+def _clamp_start_to_limit(start: str | None, limit_days: int | None) -> str | None:
+    if not start or not limit_days:
+        return start
+    start_ts = pd.to_datetime(start, errors='coerce')
+    if pd.isna(start_ts):
+        return start
+    now = pd.Timestamp.now(tz=start_ts.tzinfo)
+    cutoff = (now - pd.Timedelta(days=int(limit_days))).floor('D')
+    if start_ts < cutoff:
+        if start_ts.tzinfo is None:
+            return cutoff.date().isoformat()
+        return cutoff.isoformat()
+    return start
+
+def _clamp_period_to_limit(period: str | None, limit_days: int | None) -> str | None:
+    if not period or not limit_days:
+        return period
+    if period == 'max':
+        return f"{int(limit_days)}d"
+    days = _period_to_days_simple(period)
+    if days is not None and days > int(limit_days):
+        return f"{int(limit_days)}d"
+    return period
+
+def _prepare_yahoo_request(interval: str, period: str | None, start: str | None) -> tuple[str, str | None, str | None]:
+    yf_interval = _normalize_yf_interval(interval)
+    limit_days = _get_yf_interval_limit_days(interval)
+    safe_period = _clamp_period_to_limit(period, limit_days)
+    safe_start = _clamp_start_to_limit(start, limit_days)
+    return yf_interval, safe_period, safe_start
 def _period_to_offset(period: str | None) -> pd.DateOffset | None:
     if not period or period == "max":
         return None
@@ -156,6 +229,15 @@ def _limit_history(df: pd.DataFrame, *, start: str | None, period: str | None) -
     if start:
         start_ts = pd.to_datetime(start, errors="coerce")
         if pd.notna(start_ts):
+            idx_tz = getattr(out.index, "tz", None) if hasattr(out.index, "tz") else None
+            start_tz = getattr(start_ts, "tzinfo", None)
+            if idx_tz is not None:
+                if start_tz is None:
+                    start_ts = start_ts.tz_localize(idx_tz)
+                else:
+                    start_ts = start_ts.tz_convert(idx_tz) if hasattr(start_ts, "tz_convert") else start_ts.tz_localize(idx_tz)
+            elif start_tz is not None:
+                start_ts = start_ts.tz_localize(None) if hasattr(start_ts, "tz_localize") else start_ts
             out = out.loc[out.index >= start_ts]
     offset = _period_to_offset(period)
     if offset is not None and not out.empty:
@@ -174,11 +256,12 @@ def _yahoo_download_many_cached(
     period: str | None,
     start: str | None,
 ) -> pd.DataFrame:
-    kwargs = dict(interval=interval, auto_adjust=False, progress=False, threads=YF_THREADS)
+    yf_interval, safe_period, safe_start = _prepare_yahoo_request(interval, period, start)
+    kwargs = dict(interval=yf_interval, auto_adjust=False, progress=False, threads=YF_THREADS)
     try:
-        if start:
-            return yf.download(list(tickers), start=start, **kwargs)
-        return yf.download(list(tickers), period=period or "max", **kwargs)
+        if safe_start:
+            return yf.download(list(tickers), start=safe_start, **kwargs)
+        return yf.download(list(tickers), period=safe_period or "max", **kwargs)
     except Exception:
         return pd.DataFrame()
 
@@ -191,12 +274,13 @@ def _yahoo_download_single_cached(
     period: str | None,
     start: str | None,
 ) -> pd.DataFrame:
-    kwargs = dict(interval=interval, auto_adjust=False, progress=False, threads=YF_THREADS)
+    yf_interval, safe_period, safe_start = _prepare_yahoo_request(interval, period, start)
+    kwargs = dict(interval=yf_interval, auto_adjust=False, progress=False, threads=YF_THREADS)
     try:
-        if start:
-            data = yf.download(ticker, start=start, **kwargs)
+        if safe_start:
+            data = yf.download(ticker, start=safe_start, **kwargs)
         else:
-            data = yf.download(ticker, period=period or "max", **kwargs)
+            data = yf.download(ticker, period=safe_period or "max", **kwargs)
     except Exception:
         data = pd.DataFrame()
     if isinstance(data.columns, pd.MultiIndex):
@@ -429,6 +513,54 @@ def load_many_weekly_ohlcv(
     out["__failed__"] = pd.Series(sorted(missing)) if missing else pd.Series([], dtype=str)
     return out
 
+def load_many_interval_ohlcv(
+    tickers: list[str],
+    *,
+    interval: str,
+    period: str = "5y",
+    start: str | None = None,
+    retries: int = 1,
+    source_priority: List[str] | None = None,
+) -> Dict[str, pd.DataFrame]:
+    if not interval:
+        return {"__failed__": pd.Series([], dtype=str)}
+    if interval == "1wk":
+        return load_many_weekly_ohlcv(
+            tickers, period=period, start=start, retries=retries, source_priority=source_priority
+        )
+    out: Dict[str, pd.DataFrame] = {}
+    uniq = sorted({t for t in tickers if t})
+    missing: set[str] = set(uniq)
+    if not missing:
+        out["__failed__"] = pd.Series([], dtype=str)
+        return out
+    priority = normalize_source_priority(source_priority)
+    for source in priority:
+        if not missing:
+            break
+        if source == "yahoo":
+            fetched, missing = _load_many_from_yahoo(
+                list(missing), interval=interval, period=period, start=start, retries=retries
+            )
+            for ticker, df in fetched.items():
+                out[ticker] = df
+                _record_cache_entry(
+                    ticker=ticker, interval=interval, df=df, source=source, period=period, start=start
+                )
+        elif source == "stooq" and interval in STOOQ_INTERVAL_MAP:
+            for ticker in list(missing):
+                fallback = fetch_stooq_ohlcv(ticker, interval=interval, start=start, period=period)
+                if fallback.empty:
+                    continue
+                out[ticker] = fallback
+                _record_cache_entry(
+                    ticker=ticker, interval=interval, df=fallback, source=source, period=period, start=start
+                )
+                missing.discard(ticker)
+    out["__failed__"] = pd.Series(sorted(missing)) if missing else pd.Series([], dtype=str)
+    return out
+
+
 def load_htf_ohlcv(
     yahoo_ticker: str,
     *,
@@ -493,3 +625,4 @@ def load_many_htf_ohlcv(
             continue
     out["__failed__"] = pd.Series(sorted(missing)) if missing else pd.Series([], dtype=str)
     return out
+

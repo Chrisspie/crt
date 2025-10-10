@@ -11,9 +11,12 @@ def build_plotly_chart(d: pd.DataFrame, rec: Dict[str, Any], ticker: str) -> go.
                 fig.add_hline(y=float(y), line_dash=dash, annotation_text=text, annotation_position="left")
         except Exception:
             pass
-    add_hline(rec.get("Trigger"), "Trigger", "solid")
+    ep_val = rec.get("EP", rec.get("Trigger"))
+    add_hline(ep_val, "EP", "solid")
     add_hline(rec.get("Stop"), "SL", "dot")
     add_hline(rec.get("TP1"), "TP1", "dash")
+    add_hline(rec.get("TP_MIN"), "TP_MIN", "dash")
+    add_hline(rec.get("TP_ext"), "TP_ext", "dash")
     add_hline(rec.get("TP2"), "TP2", "dash")
     add_hline(rec.get("KeyLevel"), "Key", "dot")
     c2_date = pd.to_datetime(rec.get("C2"), errors="coerce")
